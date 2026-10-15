@@ -1,0 +1,59 @@
+# 自定义预设与字段映射：可直接合并进 profile patch 的示例。
+# 安装后请按自己环境的路径与预设调整，不要照搬信任列表。
+
+- id: workspace-mcp-glue
+  config:
+    # 需要哪些内置预设、按什么顺序加载（先加载者先注册；冲突由 conflictPolicy 决定）
+    enabledBuiltins: [root, vscode, codex, cursor, gemini]
+
+    # 只读取工作区内的文件；相对路径相对 agent 会话的 cwd
+    conflictPolicy: error       # error | first-wins | last-wins
+    trustMode: manual           # manual | all（all 等于信任一切仓库，谨慎）
+    trustedWorkspaces:          # 这个目录里的声明全部允许自动加载；精确匹配目录本身，不含子目录
+      - 'D:\Data\Project\team-a'
+
+    # 按工作区的例外：不信整个目录，只信这里列出的东西
+    # （面板里的开关就是往这里写；allowTools 用 public 名 mcp__<server>__<tool>）
+    workspaceAllowances:
+      - workspace: 'D:\Data\Project\other-repo'
+        allowMcp: [team-tools]
+        allowTools: ['mcp__team-tools__identity']
+
+    # 仅供 VS Code ${input:id} 一类变量取值；不执行项目里的 inputs.command
+    inputValues:
+      team-token: 'set-me-explicitly'
+
+    maxFileBytes: 1048576
+    maxServers: 32
+    startupTimeoutMs: 15000
+
+    presets:
+      # 团队自有 YAML 声明：任意位置 / 任意字段名（点路径或 JSON Pointer）
+      - id: team-tools
+        files: ['.team/mcp.yaml']
+        format: yaml                       # json | jsonc | toml | yaml
+        serversPaths: ['/integrations/mcp'] # 服务器表：名字 → 对象
+        dialect: standard
+        interpolation: standard            # standard | shell | none
+        fields:
+          command: executable
+          args: arguments
+          env: environment
+          cwd: workingDirectory
+          transport: connection.type
+          url: connection.url
+          headers: connection.headers
+          # enabled / disabled 映射的是布尔标志：声明取 false 即跳过该服务器
+
+      # 继承内置 VS Code 预设，只增加一个额外文件位置
+      - id: extra-vscode
+        extends: vscode
+        files: ['.tools/mcp.json']
+
+      # 同 ID 覆盖内置预设：例如本团队不用 Cursor 的项目文件
+      - id: cursor
+        enabled: false
+
+      # 同 ID 覆盖内置预设的字段/格式，而不改插件源码
+      - id: gemini
+        interpolation: standard            # 不再解释 $VAR/%VAR%

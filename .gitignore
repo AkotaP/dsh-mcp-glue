@@ -1,0 +1,11 @@
+node_modules/
+.research/
+.pnpm-store/
+.pnpm-cache/
+*.tgz
+coverage/
+
+# Editors and OS noise
+*.log
+.DS_Store
+Thumbs.db

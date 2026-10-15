@@ -1,0 +1,5 @@
+- insert:
+    - id: workspace-mcp-glue
+      name: dsh-mcp-glue
+      config:
+        trustMode: ask
