@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-Loads project-level MCP declarations for **DeepSeek Harness 0.2.0-rc.2**. A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
+Loads project-level MCP declarations for **DeepSeek Harness 0.2.1-rc.2** (offline test baseline `0.2.0-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
 
 ## Built-in presets
 
@@ -29,7 +29,7 @@ The contract, security boundaries and activation rules are in the [management UI
 
 ## Auto reconnect
 
-- Supervision covers **only this plugin's mounts** that remain selected (`selected`) and policy-allowed (`autoAllowed`), with the native bridge verified as exactly **`0.2.0-rc.2`**. A manual (`custom`) selection still qualifies when policy permits; a manually connected, policy-unallowed server gets a single attempt. Disconnect / Stop connecting remains sticky.
+- Supervision covers **only this plugin's mounts** that remain selected (`selected`) and policy-allowed (`autoAllowed`). The native bridge is admitted by **capability**: `0.2.0-rc.2` and `0.2.1-rc.2` — the releases whose lifecycle wording was read — are trusted by version, any other release is enabled as long as it still accepts `reconnect` config and exports `createMcpToolDefinition` (the log then records "version unverified, capabilities confirmed"), and only a module lacking those falls back to native behaviour. A manual (`custom`) selection still qualifies when policy permits; a manually connected, policy-unallowed server gets a single attempt. Disconnect / Stop connecting remains sticky.
 - Transient startup and connection failures retry at **1, 2, 4, 8, 16, 30, 60 seconds × 0.8–1 random jitter**, then keep retrying indefinitely in the 60-second tier. Backoff resets only after **30 seconds** of stable connection. Model requests do not bypass it; recovery, toggling one server and normal declaration updates preserve unchanged healthy peers.
 - An outage of a selected `required` server rejects model requests until recovery without tearing down healthy peers. Background retries that detect a changed target declaration stop with `DECLARATION_CHANGED` until the next safe model-assembly / editor reconcile applies it.
 - The panel shows amber `reconnecting`, a local countdown and attempt count, plus **Stop connecting / Retry now**. Invalid declarations, authentication failures and permanent spawn errors pause retries. Unconfirmed old-process shutdown (`CLOSE_UNCONFIRMED`) blocks even manual retries until a new session or Host restart. An unverified native version/interface explicitly reports unsupported monitoring and falls back to native connections without enhanced reconnect.

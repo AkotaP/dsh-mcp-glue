@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-glue",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Session-isolated workspace MCP declarations for DeepSeek Harness with extensible presets and a composer management UI",
   "type": "module",
   "main": "src/index.js",

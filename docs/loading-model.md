@@ -2,6 +2,8 @@
 
 本页记录实现前对本机 **DeepSeek Harness 0.2.0-rc.2** 的调查结论（安装位置 `D:\Soft\DSH\resources\app.asar`，运行入口 `resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js`）。结论都来自对归档内 `dsh/node_modules/@deepseek-ai/*` 的只读阅读：asar 是"16 字节头部（含 JSON 索引）+ 文件数据"的简单容器，需要复核时直接按该格式解包即可。
 
+> **0.2.1-rc.2 复核**：本机随后升级到 DSH `0.2.1-rc.2`（`@deepseek-ai/dsh-mcp-client` 同为 `0.2.1-rc.2`）。对归档内该模块的只读比对确认：本插件依赖的三条生命周期日志措辞、`Config.reconnect` 字段、导出集合（`Config / apply / createMcpToolDefinition / inject / name`）全部未变，因此适配层沿用同一实现，版本准入改为“已验证版本 + 能力兜底”。离线测试套件的 `devDependencies` 仍固定在 `0.2.0-rc.2`。
+
 ## 1. 原生加载链路
 
 | 环节 | 事实 |
