@@ -107,7 +107,13 @@ export function createNativeAdapter(nativePlugin, { onEvent, logger, serverName 
       function observe(object, key) {
         const method = object[key];
         return replaceMethod(object, key, async function (...args) {
-          try { return await Reflect.apply(method, object, args); }
+          try {
+            const value = await Reflect.apply(method, object, args);
+            // A real server response is the strongest liveness proof there is, and it is
+            // what keeps a blocked reachability probe from tearing down a working connection.
+            emit({ kind: 'request-ok' });
+            return value;
+          }
           catch (error) {
             try {
               const chain = causes(error);

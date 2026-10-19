@@ -32,7 +32,7 @@ function safeTarget(approval) {
   };
 }
 
-export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrictions, selected, autoAllowed, selectionMode, mounted, serverStates, requiredFailure, monitoring }) {
+export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrictions, selected, autoAllowed, selectionMode, mounted, serverStates, requiredFailure, monitoring, now, freshnessMs }) {
   const rows = [];
   const loadable = new Map();
   for (const entry of plan?.servers ?? []) {
@@ -54,6 +54,12 @@ export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrict
     const declared = restrictions?.get(serverName);
     const disabledTools = declared === undefined ? [] : tools.filter(tool =>
       declared.deny.includes(tool) || (declared.allow !== undefined && !declared.allow.includes(tool)));
+    // A green dot is a claim about the recent past, so it expires on its own: only a probe
+    // (or real traffic) renews it. stdio rows are always confirmed, because a child exit
+    // reaches the native bridge directly.
+    const http = live?.http === true;
+    const verified = state !== SERVER_STATES.connected ? false
+      : !http || (live?.confirmed !== false && live?.lastVerifiedAt !== undefined && now !== undefined && now - live.lastVerifiedAt <= freshnessMs);
     rows.push({
       id: serverName,
       transport,
@@ -62,6 +68,8 @@ export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrict
       target: safeTarget(entry.spec.approval),
       selected: isSelected,
       state,
+      verified,
+      lastVerifiedAt: live?.lastVerifiedAt,
       tools,
       disabledTools,
       error: live?.error,

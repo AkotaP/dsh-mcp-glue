@@ -257,6 +257,9 @@ const DICT = {
   "state.invalid": ["声明有问题", "Declaration problem"],
   "state.pending": ["连接中", "Connecting"],
   "state.reconnecting": ["重连中", "Reconnecting"],
+  "state.stale": ["待确认", "Unverified"],
+  "row.lastVerified": ["上次确认：{seconds} 秒前", "Last confirmed {seconds}s ago"],
+  "row.neverVerified": ["尚未确认连接状态", "Not confirmed yet"],
   "row.retryAfter": ["约 {seconds} 秒后重试 · 第 {attempt} 次", "Retry in about {seconds}s · attempt {attempt}"],
   "action.retryNow": ["立即重试", "Retry now"],
   "action.stopConnecting": ["停止连接", "Stop connecting"],
@@ -327,7 +330,7 @@ const statusSignature = status => (status === undefined ? '' : [
   status.trusted === true ? 'trusted' : 'untrusted',
   // The panel unfolds a row's tool list now, so its contents are part of the view as well.
   status.monitoring ?? '',
-  ...(status.servers ?? []).map(row => JSON.stringify([row.id, row.state, toolNames(row), row.error, row.reconnect])),
+  ...(status.servers ?? []).map(row => JSON.stringify([row.id, row.state, row.verified, toolNames(row), row.error, row.reconnect])),
 ].join('|'));
 
 /** A read that failed (or a session not created yet) retries fast first, then doubles. */
@@ -404,7 +407,7 @@ const CSS = `
 .wmcp-dot{position:relative;display:inline-block;width:10px;height:10px;flex:none;color:var(--dsw-alias-state-idle-primary)}
 .wmcp-dot::after{content:'';position:absolute;inset:20%;border-radius:50%;background:currentColor}
 .wmcp-dot[data-state=connected]{color:var(--dsw-alias-state-success-primary)}
-.wmcp-dot[data-state=unauthorized],.wmcp-dot[data-state=unloaded],.wmcp-dot[data-state=reconnecting]{color:var(--dsw-alias-state-warn-primary)}
+.wmcp-dot[data-state=unauthorized],.wmcp-dot[data-state=unloaded],.wmcp-dot[data-state=reconnecting],.wmcp-dot[data-state=stale]{color:var(--dsw-alias-state-warn-primary)}
 .wmcp-dot[data-state=failed],.wmcp-dot[data-state=invalid]{color:var(--dsw-alias-state-error-primary)}
 .wmcp-dot[data-state=pending]{color:var(--dsw-alias-label-tertiary)}
 /* Preset + trust page on the plugin detail page: one header, three cards, one footer. */
@@ -653,8 +656,10 @@ function chipSummary(status, error) {
       : rows.length === 0 ? 'idle'
         : rows.some(row => CHIP_ERROR_STATES.has(row.state)) ? 'failed'
           : rows.some(row => CHIP_WARN_STATES.has(row.state)) ? 'unauthorized'
-            : rows.every(row => row.state === 'connected') ? 'connected'
-              : 'idle';
+            // A green dot is a claim about the recent past; an unconfirmed one is not green.
+            : rows.some(row => row.state === 'connected' && row.verified === false) ? 'unauthorized'
+              : rows.every(row => row.state === 'connected') ? 'connected'
+                : 'idle';
   return {
     state,
     label: total === 0 ? 'MCP' : `MCP ${connected}/${total}`,
@@ -1361,17 +1366,20 @@ function ServerRow(props) {
   const tools = toolNames(row);
   const allowed = (allowance?.allowMcp ?? []).includes(row.id);
   const connected = row.state === 'connected';
+  // `connected` is the connection we believe we have; `verified` is whether that belief
+  // was confirmed recently. The dot and the tag follow the weaker of the two.
+  const unverified = connected && row.verified === false;
   const connecting = row.state === 'pending' || row.state === 'reconnecting';
   const canStop = connecting && (busy === undefined || busy === `connect:${row.id}` || busy === 'connect:');
   const rowChildren = [
-    dotElement(row.state, 'dot'),
+    dotElement(unverified ? 'stale' : row.state, 'dot'),
     React.createElement(onEdit === undefined ? 'span' : 'button', {
       key: 'name',
       className: onEdit === undefined ? 'wmcp-name' : 'wmcp-name wmcp-name-button',
       ...(onEdit === undefined ? {} : { type: 'button', onClick: () => onEdit(row.id), 'aria-label': t('row.editAria', { id: row.id }) }),
       title: `${row.source?.preset ?? ''} ${row.source?.file ?? ''}${row.error === undefined ? '' : ` — ${row.error}`}`,
     }, row.id),
-    connected ? null : React.createElement('span', { key: 'tag', className: 'wmcp-tag' }, STATE_LABEL[row.state] ?? row.state),
+    connected && !unverified ? null : React.createElement('span', { key: 'tag', className: 'wmcp-tag' }, unverified ? t('state.stale') : STATE_LABEL[row.state] ?? row.state),
     showPolicy ? React.createElement(Switch, {
       key: 'allow',
       checked: allowed,
@@ -1416,6 +1424,14 @@ function ServerRow(props) {
   const children = [React.createElement('div', { key: 'row', className: 'wmcp-row' }, rowChildren)];
   if (row.state === 'reconnecting' && Number.isFinite(row.reconnect?.nextRetryAt)) {
     children.push(React.createElement(RetryCountdown, { key: 'countdown', nextRetryAt: row.reconnect.nextRetryAt, attempt: row.reconnect.attempt }));
+  }
+  if (unverified) {
+    // No network here: the server simply has not been confirmed for a while, so say that
+    // instead of still showing a green claim that may no longer be true.
+    children.push(React.createElement('span', { key: 'unverified', className: 'wmcp-tools-hint' },
+      Number.isFinite(row.lastVerifiedAt)
+        ? t('row.lastVerified', { seconds: Math.max(0, Math.round((Date.now() - row.lastVerifiedAt) / 1000)) })
+        : t('row.neverVerified')));
   }
   if (row.error !== undefined) {
     const translated = ['CLOSE_UNCONFIRMED', 'AUTH_REQUIRED', 'DECLARATION_CHANGED', 'ENOENT', 'EACCES', 'EPERM', 'AUTO_CONNECT_REVOKED', 'STARTUP_TIMEOUT'].includes(row.error);

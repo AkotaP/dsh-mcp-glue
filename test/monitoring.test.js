@@ -36,7 +36,7 @@ test('assembly refresh catches background registry changes after the Host snapsh
     source: { file: '.mcp.json', preset: 'root', server: 'wire' },
     spec: { config: { serverName: 'wire', transport: 'streamable-http', url: 'http://fixture.invalid/mcp' } },
   }] };
-  const installed = await installWorkspaceLoader(ctx, { trustMode: 'all' }, { nativePlugin, load: async () => plan });
+  const installed = await installWorkspaceLoader(ctx, { trustMode: 'all' }, { nativePlugin, load: async () => plan, health: false });
   const state = installed.stateFor(owner);
   await state.reconcile();
   ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
@@ -75,7 +75,7 @@ test('refresh preserves upstream MCP visibility filters, including unrelated glo
   const load = async () => ({ cwd: process.cwd(), fingerprint: String(loadable), diagnostics: [], servers: loadable ? [{
     source: { file: '.mcp.json', preset: 'root', server: 'wire' }, spec: { config: { serverName: 'wire', transport: 'streamable-http', url: 'http://fixture.invalid/mcp' } },
   }] : [] });
-  const installed = await installWorkspaceLoader(ctx, { trustMode: 'all' }, { nativePlugin, load });
+  const installed = await installWorkspaceLoader(ctx, { trustMode: 'all' }, { nativePlugin, load, health: false });
   const state = installed.stateFor(owner);
   await state.reconcile();
   ctx.on('system-prompt/assemble', async (assembly, _context, next) => {

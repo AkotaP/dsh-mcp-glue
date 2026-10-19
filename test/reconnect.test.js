@@ -112,6 +112,9 @@ async function fixture(t, { names = ['same'], required = [], config = {}, random
   let loads = 0;
   const state = session(ctx, owner, settings, {
     clock, nativePlugin: bridge.plugin,
+    // Reachability probing has its own suite; this one owns the retry timeline and counts
+    // every injected timer, so it runs without the health heartbeat.
+    health: false,
     load: async (_fs, _cwd, _config, { signal: abortSignal }) => {
       abortSignal?.throwIfAborted(); loads++; return plan;
     },

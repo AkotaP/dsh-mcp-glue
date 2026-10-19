@@ -144,10 +144,21 @@ export async function apply(ctx, config) {
     const state = exec?.agent === undefined ? undefined : loader.stateFor(exec.agent);
     if (state === undefined || typeof exec.name !== 'string' || !exec.name.startsWith('mcp__')) return next();
     // Leave every global or sibling-plugin MCP alone: only this session's own mounts are ours.
-    if (![...state.mountedServers()].some(server => exec.name.startsWith(`mcp__${server}__`))) return next();
+    const owned = [...state.mountedServers()].find(server => exec.name.startsWith(`mcp__${server}__`));
+    if (owned === undefined) return next();
     // During recovery an inherited global definition may become visible beneath
     // the removed scoped registration. A textual namespace alone does not own it.
     if (ctx.tools.get(exec.name, exec.agent) === ctx.tools.get(exec.name)) return next();
+    // A stale confirmation costs a bounded probe here; letting the call proceed would cost
+    // the whole tool timeout. Never replay the call afterwards.
+    const verdict = await state.verifyBeforeCall(owned, exec.signal);
+    if (verdict !== undefined && verdict.reachable === false) {
+      return {
+        kind: 'deny',
+        reason: `工作区 MCP「${owned}」当前不可达（${verdict.code}），正在自动重连，请稍后重试`,
+        info: { name: exec.name, code: 'WORKSPACE_MCP_UNREACHABLE', reason: `可达性探测失败：${verdict.code}` },
+      };
+    }
     if (state.canInvokeWithoutApproval(exec.name) || unconfined(exec)) return next();
     // The project can forbid its own tools, and that prohibition is enforced by a guard after
     // this gate — a guard can only deny, so the question would have no honest answer. Skip it

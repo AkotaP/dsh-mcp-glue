@@ -125,7 +125,8 @@ test('scoped registration overlays preserve every definition field, receivers, i
   assert.equal(resourceService.register, registerResources);
   assert.equal(records.length, 1);
   assert.deepEqual(records[0], { level: 'debug', args: ['workspace-mcp: native debug (bridge; details redacted)'] });
-  assert.deepEqual(events, []);
+  // Two tool calls and one resource read all reached the (fake) server: each is a liveness proof.
+  assert.deepEqual(events, [{ kind: 'request-ok' }, { kind: 'request-ok' }, { kind: 'request-ok' }]);
   await dispose(fiber);
   assert.equal(disposed, 1); assert.equal(innerDisposed, 1);
   assert.equal(ctx.tools.get('bridge_tool', owner), globalTool);
@@ -188,7 +189,7 @@ test('raw typed tool/provider exceptions are observed before ToolRuntime normali
     for (const operation of [() => wrapped.execute({}, exec(owner)), () => ctx.mcpResources.request('typed', { method: 'resources/list' }, exec(owner))]) {
       events.length = 0;
       await assert.rejects(operation, caught => caught === error);
-      assert.deepEqual(events, code ? [{ kind: 'request-failed', code, retryable }] : []);
+      assert.deepEqual(events.filter(event => event.kind !== 'request-ok'), code ? [{ kind: 'request-failed', code, retryable }] : []);
     }
   }
   thrown = httpError(503);
@@ -199,7 +200,7 @@ test('raw typed tool/provider exceptions are observed before ToolRuntime normali
   assert.deepEqual(events, []);
   const result = await ctx.tools.execute({ name: 'bridge_failure', ...exec(owner) });
   assert.equal(result.isError, true);
-  assert.deepEqual(events, [{ kind: 'request-failed', code: 'HTTP_503', retryable: true }]);
+  assert.deepEqual(events.filter(event => event.kind !== 'request-ok'), [{ kind: 'request-failed', code: 'HTTP_503', retryable: true }]);
   assert.equal(result.error.code, undefined, 'ToolRuntime drops the raw transport code');
   await dispose(fiber);
 });
@@ -263,10 +264,10 @@ test('real native scoped tools, resources and image projection work; global nati
   state.failure = 404;
   const failed = await ctx.tools.execute({ name: 'mcp__wire__identity', ...exec(owner) });
   assert.equal(failed.isError, true);
-  assert.deepEqual(events, [{ kind: 'request-failed', code: 'SESSION_EXPIRED', retryable: true }]);
+  assert.deepEqual(events.filter(event => event.kind !== 'request-ok'), [{ kind: 'request-failed', code: 'SESSION_EXPIRED', retryable: true }]);
   events.length = 0;
   await assert.rejects(() => ctx.mcpResources.request('wire', { method: 'resources/list' }, exec(owner)), error => error instanceof SdkHttpError && error.data.status === 404);
-  assert.deepEqual(events, [{ kind: 'request-failed', code: 'SESSION_EXPIRED', retryable: true }]);
+  assert.deepEqual(events.filter(event => event.kind !== 'request-ok'), [{ kind: 'request-failed', code: 'SESSION_EXPIRED', retryable: true }]);
   events.length = 0;
   await ctx.tools.execute({ name: 'mcp__wire__identity', ...exec(other) });
   assert.deepEqual(events, [], 'global requests are never intercepted');
@@ -288,7 +289,7 @@ test('real native zero-tool server is ready and its resources remain scoped', { 
   const resources = await ctx.mcpResources.request('zero', { method: 'resources/list' }, exec(owner));
   assert.equal(resources.resources[0].name, 'wire-resource');
   assert.throws(() => ctx.mcpResources.request('zero', { method: 'resources/list' }, exec(other)), /unavailable/);
-  assert.deepEqual(events, []);
+  assert.deepEqual(events, [{ kind: 'request-ok' }], 'the scoped resource read answered, so it confirmed liveness');
   await dispose(fiber);
   assert.throws(() => ctx.mcpResources.request('zero', { method: 'resources/list' }, exec(owner)), /unavailable/);
 });

@@ -5,6 +5,7 @@ import { publicToolName } from './normalize.js';
 import { SERVER_STATES, buildStatus } from './status.js';
 import { createNativeAdapter, classifyConnectionError, supportsNativeBridge } from './bridge.js';
 import { realClock, retryDelay, STABLE_MS, createConnectionLimiter } from './retry.js';
+import { HEALTH, probeHttp, probeTarget } from './health.js';
 
 /**
  * Registration boundary used for one configuration generation.
@@ -101,10 +102,15 @@ function refreshBaseDelta(assembly, previous, fresh) {
 
 /** Idempotent, ordered per-Agent lifecycle. Never registers project tools globally. */
 export class WorkspaceMcpSession {
-  constructor(agent, config, { load = loadWorkspace, nativePlugin, nativeVersion = '0.2.0-rc.2', clock = realClock, makeBoundary = createBoundary, logger, scopeOwner, optionalServices } = {}) {
+  constructor(agent, config, { load = loadWorkspace, nativePlugin, nativeVersion = '0.2.0-rc.2', clock = realClock, fetchImpl = fetch, health = true, makeBoundary = createBoundary, logger, scopeOwner, optionalServices } = {}) {
     this.agent = agent; this.config = config; this.load = load;
     this.nativePlugin = nativePlugin; this.makeBoundary = makeBoundary;
     this.clock = clock;
+    this.fetchImpl = fetchImpl;
+    /** Probing can be switched off by an embedder that owns connectivity itself. */
+    this.healthEnabled = health !== false;
+    /** Last time this session did anything MCP-shaped: it gates the probe cadence. */
+    this.lastActivityAt = clock.now();
     this.monitoring = supportsNativeBridge(nativePlugin, nativeVersion);
     this.mounts = new Map();
     this.knownServers = new Set();
@@ -163,7 +169,7 @@ export class WorkspaceMcpSession {
       this.allowance.workspace ?? '-',
       [...this.effectiveSelection()].sort().join(','),
       this.requiredFailure ? 'required-failed' : '-',
-      [...this.serverStates.entries()].map(([name, value]) => JSON.stringify([name, value.state, value.tools, value.error, value.reconnect])).sort().join(','),
+      [...this.serverStates.entries()].map(([name, value]) => JSON.stringify([name, value.state, value.tools, value.error, value.reconnect, this.verified(value) ? 1 : 0])).sort().join(','),
       JSON.stringify(this.allowance),
       this.monitoring ? 'monitored' : 'unsupported',
     ].join('|');
@@ -370,6 +376,8 @@ export class WorkspaceMcpSession {
   }
   /** Management-UI view: declarations, trust state, live connection state. */
   async status(signal, { refresh = false } = {}) {
+    // Someone is looking, which is exactly when a stale confirmation is worth refreshing.
+    this.noteActivity();
     if (refresh || !this.plan) await this.preview(signal);
     const cwd = this.agent.session?.header?.cwd;
     const fs = this.filesystem();
@@ -388,6 +396,8 @@ export class WorkspaceMcpSession {
       serverStates: this.serverStates,
       requiredFailure: this.requiredFailure,
       monitoring: this.monitoring,
+      now: this.clock.now(),
+      freshnessMs: this.freshnessMs(),
     });
   }
   /**
@@ -586,14 +596,137 @@ export class WorkspaceMcpSession {
     this.serverStates.set(record.name, {
       state, tools: state === SERVER_STATES.connected ? this.toolNamesFor(record.name) : [], error,
       reconnect: { eligible: this.eligible(record), attempt: record.failures, nextRetryAt, reason: error ?? null },
+      /** Whether this transport is covered by reachability probing at all. */
+      http: probeTarget(record.entry?.spec) !== undefined,
+      /** Cleared by a failed probe, so one bad probe withdraws the green claim immediately. */
+      confirmed: record.confirmed !== false,
+      lastVerifiedAt: record.lastVerifiedAt,
     });
     this.requiredFailure = [...this.mounts.values()].some(item => item.entry.spec.required
       && this.effectiveSelection().has(item.name) && this.serverStates.get(item.name)?.state !== SERVER_STATES.connected);
     this.publish();
   }
+  /**
+   * Whether a connected row's state was confirmed recently enough to be shown as fact.
+   *
+   * This is the honest half of the feature and it costs no network: a row that has not
+   * been confirmed within two probe intervals simply stops claiming to be green. stdio
+   * rows are always "confirmed" because a child exit reaches the native bridge directly.
+   */
+  verified(state) {
+    if (!state || state.state !== SERVER_STATES.connected) return false;
+    if (state.http !== true) return true;
+    if (state.confirmed === false) return false;
+    return state.lastVerifiedAt !== undefined && this.clock.now() - state.lastVerifiedAt <= this.freshnessMs();
+  }
+  /** How long a confirmation stays valid: two probe intervals of the current cadence. */
+  freshnessMs() {
+    return this.clock.now() - this.lastActivityAt <= HEALTH.hotWindowMs ? HEALTH.hotMs * 2 : HEALTH.warmMs * 2;
+  }
+  /** Any MCP-shaped work restarts the heartbeat and refreshes the staleness clock. */
+  noteActivity() {
+    this.lastActivityAt = this.clock.now();
+    for (const record of this.mounts.values()) {
+      if (record.probeTimer === undefined && record.probing === undefined) this.scheduleHealth(record);
+    }
+    this.publish();
+  }
+  healthApplies(record) {
+    return this.healthEnabled && this.monitoring && !this.closed && !record.stopped && record.down !== true
+      && this.serverStates.get(record.name)?.state === SERVER_STATES.connected
+      && probeTarget(record.entry?.spec) !== undefined;
+  }
+  /**
+   * When the next probe is due. `undefined` means the session has been idle long enough
+   * that nothing should run: activity restarts it, and the staleness rule keeps the panel
+   * honest in the meantime.
+   */
+  healthDelay(record, override) {
+    if (override !== undefined) return override;
+    const idle = this.clock.now() - this.lastActivityAt;
+    if (idle > HEALTH.warmWindowMs) return undefined;
+    const interval = idle <= HEALTH.hotWindowMs ? HEALTH.hotMs : HEALTH.warmMs;
+    const due = (record.lastVerifiedAt ?? 0) + interval;
+    return Math.max(0, due - this.clock.now());
+  }
+  scheduleHealth(record, override) {
+    this.clock.clearTimeout(record.probeTimer); record.probeTimer = undefined;
+    if (!this.healthApplies(record)) return;
+    const delay = this.healthDelay(record, override);
+    if (delay === undefined) return;
+    const token = record.token;
+    record.probeTimer = this.clock.setTimeout(() => {
+      record.probeTimer = undefined;
+      void this.checkHealth(record, token);
+    }, delay);
+  }
+  /** The heartbeat tick: probe, then either record the confirmation or reschedule. */
+  async checkHealth(record, token) {
+    if (!this.current(record, token) || !this.healthApplies(record)) return;
+    const result = await this.probeRecord(record);
+    if (!this.current(record, token) || result === undefined || result.cancelled === true) return;
+    if (this.serverStates.get(record.name)?.state === SERVER_STATES.connected) this.scheduleHealth(record, result.reachable ? undefined : HEALTH.confirmMs);
+  }
+  /**
+   * Probe one mounted record, sharing any in-flight probe.
+   *
+   * One failure only withholds the green dot and schedules a fast confirmation; a second
+   * consecutive failure hands the server to the existing reconnect supervisor, which owns
+   * disposal and recovery. Successful real traffic resets the strike count, so a blocked
+   * probe can never tear down a connection that demonstrably still works.
+   */
+  async probeRecord(record, signal) {
+    const url = probeTarget(record.entry?.spec);
+    if (url === undefined) return { reachable: true, skipped: true };
+    if (record.probing !== undefined) return record.probing;
+    const token = record.token;
+    record.lastProbeAt = this.clock.now();
+    const probe = probeHttp(url, {
+      timeoutMs: HEALTH.probeTimeoutMs, fetchImpl: this.fetchImpl,
+      signal: signal ? AbortSignal.any([signal, this.abort.signal]) : this.abort.signal,
+    });
+    record.probing = probe;
+    let result;
+    try { result = await probe; }
+    finally { if (record.probing === probe) record.probing = undefined; }
+    if (!this.current(record, token) || result?.cancelled === true) return result;
+    if (result.reachable) {
+      record.probeFailures = 0;
+      record.confirmed = true;
+      record.lastVerifiedAt = this.clock.now();
+      this.viewRecord(record, SERVER_STATES.connected, undefined);
+      return result;
+    }
+    record.probeFailures += 1;
+    record.confirmed = false;
+    this.viewRecord(record, SERVER_STATES.connected, undefined); // still connected, just unconfirmed
+    if (record.probeFailures >= HEALTH.failuresToOffline) {
+      this.logger.info(`workspace-mcp: ${record.name} unreachable (${result.code}); reconnecting`);
+      await this.enqueue(() => this.current(record, token) && !record.down
+        ? this.failed(record, { code: result.code ?? 'PROBE_FAILED', retryable: true }) : undefined).catch(() => {});
+    } else this.scheduleHealth(record, HEALTH.confirmMs);
+    return result;
+  }
+  /**
+   * The model is about to call one of this server's tools: a stale confirmation is worth
+   * a bounded probe, because failing here costs a second while failing inside the call
+   * costs the whole tool timeout.
+   * @returns the probe result when one ran, else undefined (fresh, stdio, or not mounted).
+   */
+  async verifyBeforeCall(serverName, signal) {
+    const record = this.mounts.get(serverName);
+    if (!this.healthEnabled || record === undefined || record.stopped || this.closed) return undefined;
+    if (probeTarget(record.entry?.spec) === undefined) return undefined;
+    if (this.serverStates.get(serverName)?.state !== SERVER_STATES.connected) return undefined;
+    const at = record.lastVerifiedAt;
+    if (at !== undefined && this.clock.now() - at <= HEALTH.freshMs) return undefined;
+    this.noteActivity();
+    return this.probeRecord(record, signal);
+  }
   cancelRecord(record) {
     record.stopped = true;
     this.clock.clearTimeout(record.timer); record.timer = undefined;
+    this.clock.clearTimeout(record.probeTimer); record.probeTimer = undefined;
     record.controller?.abort(new Error('workspace MCP connection stopped'));
   }
   async closeBoundary(record, boundary, token = record.token) {
@@ -628,6 +761,17 @@ export class WorkspaceMcpSession {
     return operation.finally(() => this.publish());
   }
   nativeEvent(record, token, event) {
+    // A answered request is proof of life and needs no queue: record it inline so the next
+    // tool call skips its pre-check entirely.
+    if (event.kind === 'request-ok') {
+      if (!this.current(record, token)) return;
+      record.lastVerifiedAt = this.clock.now();
+      record.probeFailures = 0;
+      record.confirmed = true;
+      this.lastActivityAt = record.lastVerifiedAt;
+      this.publish();
+      return;
+    }
     if (event.kind === 'unsafe-close' && (this.current(record, token) || record.closingToken === token)) this.unsafeNames.add(record.name);
     if (!this.current(record, token)) return;
     // Never dispose from the native logger/execute call stack.
@@ -666,6 +810,9 @@ export class WorkspaceMcpSession {
   async failed(record, failure) {
     if (!this.current(record) || record.down) return;
     record.down = true;
+    // The reconnect supervisor owns the server from here; its own attempts are the probe.
+    this.clock.clearTimeout(record.probeTimer); record.probeTimer = undefined;
+    record.probeFailures = 0;
     if (record.connectedAt !== undefined && this.clock.now() - record.connectedAt >= STABLE_MS) record.failures = 0;
     record.connectedAt = undefined;
     record.error = failure.code; record.retryable = failure.retryable;
@@ -728,7 +875,12 @@ export class WorkspaceMcpSession {
         }
       }
       record.connectedAt = this.clock.now(); record.error = undefined;
+      // A just-opened connection is its own confirmation.
+      record.lastVerifiedAt = record.connectedAt;
+      record.confirmed = true;
+      record.probeFailures = 0;
       this.viewRecord(record, SERVER_STATES.connected);
+      this.scheduleHealth(record);
       if (record.failures > 0) this.logger.info(`workspace-mcp: ${record.name} reconnected`);
     } catch (error) {
       if (!this.current(record, token)) return;
@@ -927,6 +1079,9 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
     if (!agent || ctx.agents.get(agent.id) !== agent) return next();
     const state = attach(agent);
     if (!state) return next();
+    // A model request is the moment the tool set is about to be used: keep the heartbeat
+    // warm here. The probe itself stays off this path so assembly never waits on a socket.
+    state.noteActivity();
     const frame = frames.get(context) ?? state.assemblyFrame();
     // Background recovery may move the registry after the Host's initial snapshot.
     // Compare against that raw frame while retaining upstream visibility filters.
