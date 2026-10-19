@@ -965,6 +965,10 @@ function Chip(props) {
    * Granting it also mounts the server now, and revoking it also drops the connection: the
    * switch is the whole decision, so turning it back off must not leave the declaration running
    * as a side effect of the earlier grant.
+   *
+   * Revoking is a *policy* change, not a manual override: in automatic mode the loader has
+   * already stopped that server, and recording a manual selection here would freeze the whole
+   * set and show an unnecessary "follow policy". Only a manual selection needs the explicit stop.
    */
   const toggleAllowMcp = async serverId => {
     const workspace = allowanceKey();
@@ -974,7 +978,8 @@ function Chip(props) {
     try {
       await saveAllowance(workspace, allowances => withAllowedServer(allowances, workspace, serverId));
       if (alive.current) setError(undefined);
-      await act(allowed ? 'disconnect' : 'connect', serverId);
+      if (!allowed) await act('connect', serverId);
+      else if (status?.selectionMode === 'custom') await act('disconnect', serverId);
     } catch (reason) {
       if (alive.current) setError(reason instanceof Error ? reason.message : String(reason));
       void loadProfile();

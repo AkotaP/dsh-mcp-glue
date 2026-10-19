@@ -401,22 +401,33 @@ export class WorkspaceMcpSession {
     });
   }
   /**
-   * Explicit user consent from the panel: load this server, or every declared one, right now.
+   * Explicit user action from the panel: connect a server, or every declared one, right now.
    *
-   * The selection is pinned to `custom`, so what the user asked for by hand is never silently
-   * re-derived from the policy, and a later declaration change cannot re-add what they turned
-   * off. `follow()` is the way back to the policy.
+   * Two different things reach this method and they must not be conflated:
+   *
+   * - **Granting** a server the policy does not authorize is an intent change. It pins
+   *   `custom`, so a later declaration or policy change cannot silently re-add what the
+   *   user turned off by hand, and `follow()` is the way back to the policy.
+   * - **Retrying** a server the policy already authorizes ("连接" on a failed row, or
+   *   "立即重试") is *not* an intent change. Pinning `custom` there would freeze the set and
+   *   show an unnecessary "恢复自动" for a decision the user never made.
    */
   async connect(signal, serverId) {
     const plan = await this.preview(signal);
     if (!plan) return undefined;
-    if (serverId === undefined) this.selection = new Set(plan.servers.map(entry => entry.spec.config.serverName));
-    else {
-      if (this.selectionMode !== 'custom') this.selection = this.effectiveSelection(plan);
-      this.selection.add(serverId);
+    // The declaration may be newer than the last policy snapshot; authorize against fresh policy.
+    await this.refreshPolicy(plan, signal);
+    const names = serverId === undefined
+      ? plan.servers.map(entry => entry.spec.config.serverName) : [serverId];
+    const unauthorized = names.filter(name => !this.policyAllowed.has(name));
+    if (this.selectionMode === 'custom') {
+      // Already manual: an added server is part of the manual set, never a mode change.
+      this.selection = new Set([...this.selection, ...names]);
+    } else if (unauthorized.length > 0) {
+      this.selection = new Set([...this.effectiveSelection(plan), ...unauthorized]);
+      this.selectionMode = 'custom';
     }
-    this.selectionMode = 'custom';
-    for (const name of serverId === undefined ? this.selection : [serverId]) {
+    for (const name of names) {
       const record = this.mounts.get(name);
       if (!record || record.down) this.retryRequested.add(name);
     }

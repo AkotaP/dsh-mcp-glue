@@ -64,6 +64,37 @@ test('declaration errors and failed startups are reported per server', { timeout
   assert.equal(status.counts.problems, 3);
 });
 
+test('retrying a policy-authorized server keeps the automatic intent; granting an unauthorized one pins it', async t => {
+  const ctx = await harness(t), dir = await workspace(t), a = agent(ctx, dir);
+  await writeFixture(dir, '.mcp.json', { mcpServers: { one: fixtureCommand('one'), two: fixtureCommand('two') } });
+
+  // Fully authorized: connecting is only a retry, so no manual override is recorded.
+  const automated = session(ctx, a, { trustMode: 'all' });
+  t.after(() => automated.dispose());
+  await automated.reconcile(signal());
+  assert.equal(automated.selectionMode, 'auto');
+  const retried = await automated.connect(signal(), 'one');
+  assert.equal(retried.selectionMode, 'auto', 'a retry must not show the "follow policy" escape hatch');
+  assert.equal(retried.counts.connected, 2);
+  const all = await automated.connect(signal());
+  assert.equal(all.selectionMode, 'auto', 'connecting all is still a retry when the policy already allows all');
+  await automated.disconnect(signal(), 'one');
+  assert.equal(automated.selectionMode, 'custom', 'a manual disconnect is a real intent change');
+  const followed = await automated.follow(signal());
+  assert.equal(followed.selectionMode, 'auto');
+
+  // Partially authorized: connecting the unauthorized server is an explicit grant.
+  // A separate agent keeps both sessions free to mount the same server names.
+  const partial = session(ctx, agent(ctx, dir, 'intent-partial'), { trustMode: 'manual', workspaceAllowances: [{ workspace: dir, allowMcp: ['one'] }] });
+  t.after(() => partial.dispose());
+  await partial.reconcile(signal());
+  assert.equal(partial.selectionMode, 'auto');
+  const granted = await partial.connect(signal(), 'two');
+  assert.equal(granted.selectionMode, 'custom');
+  assert.deepEqual(granted.selected.sort(), ['one', 'two']);
+  assert.equal(granted.counts.connected, 2);
+});
+
 test('manual selection: all-off is sticky, and per-server connect/disconnect work', async t => {
   const ctx = await harness(t), dir = await workspace(t), a = agent(ctx, dir);
   await writeFixture(dir, '.mcp.json', { mcpServers: { one: fixtureCommand('one') } });

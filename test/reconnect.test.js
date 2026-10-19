@@ -213,7 +213,11 @@ test('manual connect without automatic permission is one-shot, including after a
 test('custom selection still retries automatically when policy allows the selected server', async t => {
   const f = await fixture(t);
   f.bridge.mode('same').offline = true;
-  await f.state.connect(signal(), 'same');
+  // Reaching "manual, one server selected" goes through disconnect + connect; the mode
+  // itself is what this test is about, so set it without spending two extra handshakes.
+  f.state.selectionMode = 'custom';
+  f.state.selection = new Set(['same']);
+  await f.state.reconcile(signal());
   assert.equal(f.state.selectionMode, 'custom');
   assert.equal(view(f).reconnect.eligible, true);
   f.bridge.mode('same').offline = false;
@@ -373,7 +377,10 @@ test('policyChanged revocation cancels a queued retry immediately', async t => {
 test('policyChanged revocation aborts an automatic initialize already in flight, even in custom mode', async t => {
   const f = await fixture(t, { config: { trustMode: 'manual', workspaceAllowances: [{ workspace: process.cwd(), allowMcp: ['same'] }] } });
   f.bridge.mode('same').offline = true;
-  await f.state.connect(signal(), 'same');
+  // Manual selection over a policy-allowed server: the mode must not stop revocation.
+  f.state.selectionMode = 'custom';
+  f.state.selection = new Set(['same']);
+  await f.state.reconcile(signal());
   const behavior = f.bridge.mode('same');
   behavior.offline = false; behavior.gate = deferred(); behavior.entered = deferred();
   f.clock.tick(nextDelay(f));
