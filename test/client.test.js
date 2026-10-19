@@ -1359,6 +1359,23 @@ test('a copy that clears a prefilled box asks for that key to be deleted, and an
   ], 'the request carries the typed address, the chosen transport and the deletion of the emptied path');
 });
 
+test('reconnecting rows are amber, show a local countdown, and offer stop and immediate retry', async () => {
+  const { exports } = await loadClientBundle();
+  const { ServerRow, chipSummary, statusSignature } = exports.__internals;
+  const row = { id: 'wire', state: 'reconnecting', tools: [], error: 'CONNECTION_LOST', reconnect: { eligible: true, attempt: 3, nextRetryAt: Date.now() + 60000 } };
+  const status = { servers: [row], counts: { declarations: 1, connected: 0 } };
+  assert.equal(chipSummary(status).state, 'unauthorized', 'recovery uses the warning colour, not failure red');
+  const rendered = renderToStaticMarkup(React.createElement(ServerRow, { row, busy: 'connect:wire', expanded: false, showPolicy: false, onAct: noop, onToggleExpand: noop }));
+  assert.match(rendered, /重连中/);
+  assert.match(rendered, /秒后重试/);
+  assert.match(rendered, /停止连接/);
+  assert.match(rendered, /立即重试/);
+  const stop = rendered.slice(rendered.lastIndexOf('<button', rendered.indexOf('停止连接')), rendered.indexOf('停止连接'));
+  assert.doesNotMatch(stop, /disabled/, 'stop remains available while the initiating connect awaits startup');
+  assert.notEqual(statusSignature(status), statusSignature({ ...status, servers: [{ ...row, reconnect: { ...row.reconnect, nextRetryAt: row.reconnect.nextRetryAt + 1 } }] }));
+  assert.notEqual(statusSignature(status), statusSignature({ ...status, servers: [{ ...row, error: 'AUTH_REQUIRED' }] }));
+});
+
 test('a transport the Host refuses comes back as the reason on the form, never as a silent rewrite', async () => {
   const { exports } = await loadClientBundle();
   const { DeclarationWriteView, presetFields, emptyWriteDrafts } = exports.__internals;

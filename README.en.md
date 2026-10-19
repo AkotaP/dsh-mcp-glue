@@ -27,6 +27,16 @@ The client half registers its copy as `ctx.locale` dictionaries under the packag
 
 The contract, security boundaries and activation rules are in the [management UI document](<docs/management-ui.md>). The client half is the repository's build artifact `lib/client.js` (generated from `src/client.js` by `pnpm run build`); it must be built or the Host reports a missing bundle and refuses to activate. Run `pnpm run build` after changing the client source. Whether the running Host picks up the new bundle automatically depends on its development watcher, so an open page alone proves nothing. **Host**-half changes require a DSH restart, because the process keeps the module it imported at activation time.
 
+## Auto reconnect
+
+- Supervision covers **only this plugin's mounts** that remain selected (`selected`) and policy-allowed (`autoAllowed`), with the native bridge verified as exactly **`0.2.0-rc.2`**. A manual (`custom`) selection still qualifies when policy permits; a manually connected, policy-unallowed server gets a single attempt. Disconnect / Stop connecting remains sticky.
+- Transient startup and connection failures retry at **1, 2, 4, 8, 16, 30, 60 seconds × 0.8–1 random jitter**, then keep retrying indefinitely in the 60-second tier. Backoff resets only after **30 seconds** of stable connection. Model requests do not bypass it; recovery, toggling one server and normal declaration updates preserve unchanged healthy peers.
+- An outage of a selected `required` server rejects model requests until recovery without tearing down healthy peers. Background retries that detect a changed target declaration stop with `DECLARATION_CHANGED` until the next safe model-assembly / editor reconcile applies it.
+- The panel shows amber `reconnecting`, a local countdown and attempt count, plus **Stop connecting / Retry now**. Invalid declarations, authentication failures and permanent spawn errors pause retries. Unconfirmed old-process shutdown (`CLOSE_UNCONFIRMED`) blocks even manual retries until a new session or Host restart. An unverified native version/interface explicitly reports unsupported monitoring and falls back to native connections without enhanced reconnect.
+- Failed tools are never replayed; there is no idle MCP heartbeat or UnityEditor server-startup automation. A typed call error identifying an HTTP session 404 schedules fresh initialization under backoff, without replaying that call.
+
+See the [management UI reconnect contract](<docs/management-ui.md#auto-reconnect>) for details. Verification so far covers backend checks and the client build only, **not live deployment verification**. Host source changes require an actual Harness restart, not toggling the plugin row or assuming HMR.
+
 ## Install
 
 Any one of three paths. All of them place the package in the profile's `node_modules`, after which `dsh.bundle.patch` inserts the `workspace-mcp-glue` row; confirm that `dsh-mcp-glue` is enabled on the plugin page.
@@ -37,7 +47,7 @@ Any one of three paths. All of them place the package in the profile's `node_mod
   # pin a commit: 'github:<owner>/dsh-mcp-glue#<sha>'
   ```
   This path needs no build step: `lib/client.js` is committed, and `prepack` runs only for local packaging (DSH executes `pnpm add <spec>`, which does not run the pack lifecycle). The repository has no install-time script, so no dependency build script ever waits for approval.
-- **Link install (recommended while iterating)**: link the profile to this directory and reload the row from the Plugins page after editing the source.
+- **Link install (recommended while iterating)**: link the profile to this directory without repacking each time. Rebuild client source changes and confirm the Host loads the new bundle; Host source changes require an actual Harness restart (reloading the plugin row does not re-import modules).
   ```powershell
   # run in the profile directory; the spec points at this project
   pnpm add link:<absolute path to this project>
@@ -141,9 +151,9 @@ The MCP panel's title bar offers **+ New / Manage**; a server name and its `⋯`
 - The same server name may appear in workspaces A and B; their processes, tools, resources and instructions stay isolated. Different sessions in the same workspace connect separately and share no mutable process.
 - Pre-existing global MCP stays visible to sessions; a project tool with the same name shadows the global tool by DSH's scoped rules. The plugin never removes global MCP.
 - Declarations are re-read while every model request is assembled: additions, edits and deletions take effect on the **next model request**, never in the middle of a running tool call.
-- An update first unmounts the previous set of project connections, re-applies the policy (directory trust / allow list) and then loads the new configuration; unchanged declarations do not restart processes.
+- Normal updates re-apply policy (directory trust / allow list) and diff each server's spec/source: only removed, changed or deselected entries are unmounted; new/changed entries load independently, preserving unchanged healthy connections and child fibers.
 - A session that is already running loads safely on the next request after the plugin is installed or hot-reloaded. Unloading the plugin or releasing the Agent closes its connections and removes its scoped tools, resources and instructions.
-- Syntax errors and unsupported servers are recorded as bounded diagnostics and skipped without affecting other valid servers; deleting a declaration does not leave the old server behind. A Codex server with `required: true` that is **invalid or fails to start** rejects that model request instead of silently downgrading, and a failed generation is never cached as a success. Being unauthorized is different: it is simply not loaded, not an error, and the plugin never interrupts a session over a user's silence.
+- Syntax errors and unsupported servers are recorded as bounded diagnostics and skipped without affecting other valid servers; deleting a declaration does not leave the old server behind. A Codex server with `required: true` that is **invalid, fails to start or disconnects at runtime** rejects model requests instead of silently downgrading. Eligible supervised retries recover runtime failures without model requests bypassing backoff or tearing down healthy peers. An unauthorized, unselected server is different: it is simply not loaded, not an error, and the plugin never interrupts a session over a user's silence.
 - Loading happens during `system-prompt/assemble`, so added or removed servers take effect in the **current** request rather than the next turn.
 - Tool allow/deny lists are enforced by a guard this plugin registers before the call: only tools registered in that project's scope are restricted, and global MCP with the same name prefix is unaffected. A blocked tool may still appear in the schema list, but direct and PTC calls are both rejected.
 

@@ -22,7 +22,7 @@ test('an invalid required declaration fails the generation, and an unauthorized 
   assert.equal(view.loaded, false);
 });
 
-test('required transient startup failure can retry the same approved generation', async t => {
+test('required failure blocks requests without a retry storm; explicit retry repairs the same generation', async t => {
   const ctx = await harness(t), dir = await workspace(t), a = agent(ctx, dir);
   await writeFixture(dir, '.codex/config.toml', '[mcp_servers.same]\ncommand="fake-program"\nrequired=true');
   let attempts = 0;
@@ -30,7 +30,10 @@ test('required transient startup failure can retry the same approved generation'
   const state = session(ctx, a, { trustMode: 'all' }, { nativePlugin });
   t.after(() => state.dispose());
   await assert.rejects(state.reconcile(signal()), /required server failed/);
-  await state.reconcile(signal());
+  await assert.rejects(state.reconcile(signal()), /required server failed/);
+  assert.equal(attempts, 1, 'model requests must not bypass the retry scheduler');
+  const repaired = await state.connect(signal(), 'same');
+  assert.equal(repaired.requiredFailure, false);
   assert.equal(attempts, 2);
 });
 

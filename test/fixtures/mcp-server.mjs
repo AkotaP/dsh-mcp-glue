@@ -8,8 +8,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     switch (msg.method) {
       case 'initialize': return { protocolVersion: '2025-06-18', capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'fixture', version: '1' }, instructions: `Workspace ${label}: keep \${literal} literal.` };
       case 'ping': return {};
-      case 'tools/list': return { tools: [{ name: 'identity', description: 'Returns workspace identity', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }, { name: 'blocked', description: 'Filtered tool', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }] };
-      case 'tools/call': return { content: [{ type: 'text', text: JSON.stringify({ label, cwd: process.cwd(), marker: process.env.WORKSPACE_MARKER, method: msg.params.name }) }] };
+      case 'tools/list': return { tools: [{ name: 'identity', description: 'Returns workspace identity', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }, { name: 'blocked', description: 'Filtered tool', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }, ...(process.env.FIXTURE_LIFECYCLE === '1' ? [{ name: 'exit', description: 'Exit after returning a result', inputSchema: { type: 'object', properties: {} } }] : [])] };
+      case 'tools/call':
+        if (process.env.FIXTURE_LIFECYCLE === '1' && msg.params.name === 'exit') setTimeout(() => process.exit(3), 30);
+        return { content: [{ type: 'text', text: JSON.stringify({ label, cwd: process.cwd(), marker: process.env.WORKSPACE_MARKER, method: msg.params.name, ...(process.env.FIXTURE_LIFECYCLE === '1' ? { pid: process.pid } : {}) }) }] };
       case 'resources/list': return { resources: [{ uri: 'fixture://identity', name: label }] };
       case 'resources/templates/list': return { resourceTemplates: [] };
       case 'resources/read': return { contents: [{ uri: msg.params.uri, text: label }] };

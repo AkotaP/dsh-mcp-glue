@@ -12,6 +12,7 @@ export const SERVER_STATES = Object.freeze({
   connected: 'connected',
   failed: 'failed',
   pending: 'pending',
+  reconnecting: 'reconnecting',
   unauthorized: 'unauthorized',
   unloaded: 'unloaded',
   invalid: 'invalid',
@@ -31,7 +32,7 @@ function safeTarget(approval) {
   };
 }
 
-export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrictions, selected, autoAllowed, selectionMode, mounted, serverStates, requiredFailure }) {
+export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrictions, selected, autoAllowed, selectionMode, mounted, serverStates, requiredFailure, monitoring }) {
   const rows = [];
   const loadable = new Map();
   for (const entry of plan?.servers ?? []) {
@@ -64,6 +65,7 @@ export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrict
       tools,
       disabledTools,
       error: live?.error,
+      reconnect: live?.reconnect ?? { eligible: false, attempt: 0, nextRetryAt: null, reason: null },
     });
   }
   for (const issue of plan?.diagnostics ?? []) {
@@ -90,6 +92,7 @@ export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrict
     selected: selected === undefined ? rows.filter(row => row.selected).map(row => row.id) : [...selected],
     loaded,
     requiredFailure,
+    monitoring: monitoring === true ? 'supported' : 'unsupported',
     counts: {
       declarations: rows.length,
       connected: rows.filter(row => row.state === SERVER_STATES.connected).length,

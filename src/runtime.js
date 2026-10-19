@@ -3,6 +3,8 @@ import { createDeclarationEditor } from './edit.js';
 import { loadWorkspace } from './load.js';
 import { publicToolName } from './normalize.js';
 import { SERVER_STATES, buildStatus } from './status.js';
+import { createNativeAdapter, classifyConnectionError, supportsNativeBridge } from './bridge.js';
+import { realClock, retryDelay, STABLE_MS, createConnectionLimiter } from './retry.js';
 
 /**
  * Registration boundary used for one configuration generation.
@@ -99,9 +101,18 @@ function refreshBaseDelta(assembly, previous, fresh) {
 
 /** Idempotent, ordered per-Agent lifecycle. Never registers project tools globally. */
 export class WorkspaceMcpSession {
-  constructor(agent, config, { load = loadWorkspace, nativePlugin, makeBoundary = createBoundary, logger, scopeOwner, optionalServices } = {}) {
+  constructor(agent, config, { load = loadWorkspace, nativePlugin, nativeVersion = '0.2.0-rc.2', clock = realClock, makeBoundary = createBoundary, logger, scopeOwner, optionalServices } = {}) {
     this.agent = agent; this.config = config; this.load = load;
     this.nativePlugin = nativePlugin; this.makeBoundary = makeBoundary;
+    this.clock = clock;
+    this.monitoring = supportsNativeBridge(nativePlugin, nativeVersion);
+    this.mounts = new Map();
+    this.knownServers = new Set();
+    this.background = new Set();
+    this.connectionSlot = createConnectionLimiter(MOUNT_CONCURRENCY);
+    this.retryRequested = new Set();
+    // An unconfirmed shutdown must never spawn a second process under the same name.
+    this.unsafeNames = new Set();
     this.logger = logger ?? agent.ctx.logger;
     // A context that injects `tools`/`systemPrompt`, used for the guard and base assemblies.
     this.scopeOwner = scopeOwner ?? agent.ctx;
@@ -152,7 +163,9 @@ export class WorkspaceMcpSession {
       this.allowance.workspace ?? '-',
       [...this.effectiveSelection()].sort().join(','),
       this.requiredFailure ? 'required-failed' : '-',
-      [...this.serverStates.entries()].map(([name, value]) => name + ':' + value.state + ':' + value.tools.length).sort().join(','),
+      [...this.serverStates.entries()].map(([name, value]) => JSON.stringify([name, value.state, value.tools, value.error, value.reconnect])).sort().join(','),
+      JSON.stringify(this.allowance),
+      this.monitoring ? 'monitored' : 'unsupported',
     ].join('|');
     if (signature === this.published) return;
     this.published = signature;
@@ -374,6 +387,7 @@ export class WorkspaceMcpSession {
       mounted: this.group !== undefined,
       serverStates: this.serverStates,
       requiredFailure: this.requiredFailure,
+      monitoring: this.monitoring,
     });
   }
   /**
@@ -392,6 +406,10 @@ export class WorkspaceMcpSession {
       this.selection.add(serverId);
     }
     this.selectionMode = 'custom';
+    for (const name of serverId === undefined ? this.selection : [serverId]) {
+      const record = this.mounts.get(name);
+      if (!record || record.down) this.retryRequested.add(name);
+    }
     this.loadedFingerprint = undefined;
     try { await this.reconcile(signal); }
     catch (error) { this.logger.warn(`workspace-mcp: ${error.message}`); }
@@ -406,9 +424,12 @@ export class WorkspaceMcpSession {
       else { effective.delete(serverId); this.selection = effective; }
       this.selectionMode = 'custom';
     }
+    for (const [name, record] of this.mounts) {
+      if (!this.selection.has(name)) this.cancelRecord(record);
+    }
     this.loadedFingerprint = undefined;
     this.requiredFailure = false;
-    try { await this.reconcile(signal); } // Remount the servers that stay selected.
+    try { await this.reconcile(signal); } // Healthy siblings keep their child fibers.
     catch (error) { this.logger.warn(`workspace-mcp: ${error.message}`); }
     return this.status(signal);
   }
@@ -457,122 +478,374 @@ export class WorkspaceMcpSession {
     this.allowance = found;
     return found;
   }
+  /** Only native contributions: unrelated assembly middleware must not be replayed or removed. */
+  nativeAssemblySlice(base) {
+    const names = [...this.knownServers];
+    const resourceTools = ['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource'];
+    return {
+      sections: base.sections.filter(item => item.name === 'mcp-resource-servers' || names.some(name => item.name === `mcp:${name}`)),
+      tools: base.tools.filter(item => resourceTools.includes(item.name) || names.some(name => item.name.startsWith(`mcp__${name}__`))),
+      contexts: [], variables: {},
+    };
+  }
+  /** Synchronous observer called by the Host's base tool provider, before assembly middleware. */
+  assemblyFrame() {
+    const tools = this.nativeAssemblySlice({ sections: [], tools: this.scopeOwner.tools.schemas(this.agent) }).tools
+      .map(({ name, description, parameters, deferLoading }) => ({ name, description, parameters: structuredClone(parameters), ...(deferLoading === true ? { deferLoading } : {}) }));
+    const servers = new Map([...this.knownServers].map(name => {
+      const record = this.mounts.get(name);
+      return [name, [record, record?.token, record?.boundary, this.serverStates.get(name)?.state]];
+    }));
+    return { tools, servers };
+  }
+  refreshAssembly(assembly, frame, fresh) {
+    const current = this.assemblyFrame();
+    const names = new Set([...frame.servers.keys(), ...current.servers.keys()]);
+    const changed = [...names].filter(name => {
+      const before = frame.servers.get(name) ?? [], after = current.servers.get(name) ?? [];
+      return before.length !== after.length || before.some((value, index) => value !== after[index]);
+    });
+    const owned = this.nativeAssemblySlice(fresh);
+    const resourceTools = new Set(['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource']);
+    const previousTools = changed.length > 0 ? frame.tools : frame.tools.filter(tool => !resourceTools.has(tool.name));
+    if (changed.length === 0) owned.tools = owned.tools.filter(tool => !resourceTools.has(tool.name));
+    // Preserve upstream presentation/privacy filters. An absent old schema is an
+    // explicit omission, not a missing contribution for us to restore. If a filter
+    // touched a server, defer its newly introduced tool names until the next snapshot.
+    const hidden = new Set(frame.tools.filter(tool => !assembly.tools.some(item => item.name === tool.name)).map(tool => tool.name));
+    const filteredServers = [...names].filter(name => frame.tools.some(tool => hidden.has(tool.name) && tool.name.startsWith(`mcp__${name}__`)));
+    const oldNames = new Set(frame.tools.map(tool => tool.name));
+    owned.tools = owned.tools.filter(tool => !hidden.has(tool.name)
+      && (oldNames.has(tool.name) || !filteredServers.some(name => tool.name.startsWith(`mcp__${name}__`))));
+    const sectionChanged = item => changed.some(name => item.name === `mcp:${name}`)
+      || (changed.length > 0 && item.name === 'mcp-resource-servers');
+    owned.sections = owned.sections.filter(section => {
+      if (assembly.sections.some(item => item.name === section.name)) return true;
+      if (section.name === 'mcp-resource-servers') return false;
+      const server = changed.find(name => section.name === `mcp:${name}`);
+      return !frame.servers.get(server)?.[2]; // Do not restore a deliberately omitted old section.
+    });
+    refreshBaseDelta(assembly, {
+      sections: assembly.sections.filter(sectionChanged), tools: previousTools, contexts: [], variables: {},
+    }, { ...owned, sections: owned.sections.filter(sectionChanged) });
+  }
+  /** A profile save revokes retry authority immediately, including an initialize in flight. */
+  async policyChanged() {
+    const interrupted = [];
+    // Cancel initialization before waiting for the serialized work that owns it.
+    if (this.plan) {
+      await this.refreshPolicy(this.plan, this.abort.signal);
+      for (const record of this.mounts.values()) {
+        if (!this.effectiveSelection().has(record.name)) this.cancelRecord(record);
+        else if (record.autoAuthority && record.connectedAt === undefined && !this.eligible(record)) {
+          record.controller?.abort(new Error('automatic connection permission revoked'));
+          if (record.task) interrupted.push(record.task);
+        }
+      }
+    }
+    await this.enqueue(async () => {
+      if (!this.plan) return;
+      await this.refreshPolicy(this.plan, this.abort.signal);
+      for (const record of [...this.mounts.values()]) {
+        if (record.stopped || !this.effectiveSelection().has(record.name)) { await this.retire(record); continue; }
+        if (record.timer !== undefined && !this.eligible(record)) {
+          this.clock.clearTimeout(record.timer); record.timer = undefined;
+          this.viewRecord(record, SERVER_STATES.failed, record.error);
+        } else if (record.down && record.retryable && this.eligible(record)) this.schedule(record);
+        const live = this.serverStates.get(record.name);
+        if (live?.reconnect) live.reconnect.eligible = this.eligible(record);
+      }
+      this.loadedFingerprint = undefined;
+    });
+    await Promise.allSettled(interrupted);
+  }
+  refreshPolicy(plan, signal) {
+    // Concurrent initialize completions must not let an older trust lookup
+    // overwrite the result of a newer profile revocation.
+    const operation = (this.policyQueue ?? Promise.resolve()).then(async () => {
+      signal?.throwIfAborted();
+      const fs = this.filesystem();
+      this.trustedWorkspace = await this.isTrusted(fs, plan.cwd, signal).catch(() => false);
+      await this.loadAllowance(fs, plan.cwd, signal).catch(() => {
+        this.allowance = { workspace: null, allowMcp: [], allowTools: [] };
+      });
+      signal?.throwIfAborted();
+      this.policyAllowed = new Set(plan.servers.map(entry => entry.spec.config.serverName).filter(name => this.canAutoConnect(name)));
+    });
+    this.policyQueue = operation.catch(() => {});
+    return operation;
+  }
+  eligible(record) {
+    return this.monitoring && !this.closed && !record.stopped
+      && this.effectiveSelection().has(record.name) && this.policyAllowed.has(record.name);
+  }
+  current(record, token = record.token) {
+    return !this.closed && !record.stopped && this.mounts.get(record.name) === record && record.token === token;
+  }
+  viewRecord(record, state, error, nextRetryAt = null) {
+    this.serverStates.set(record.name, {
+      state, tools: state === SERVER_STATES.connected ? this.toolNamesFor(record.name) : [], error,
+      reconnect: { eligible: this.eligible(record), attempt: record.failures, nextRetryAt, reason: error ?? null },
+    });
+    this.requiredFailure = [...this.mounts.values()].some(item => item.entry.spec.required
+      && this.effectiveSelection().has(item.name) && this.serverStates.get(item.name)?.state !== SERVER_STATES.connected);
+    this.publish();
+  }
+  cancelRecord(record) {
+    record.stopped = true;
+    this.clock.clearTimeout(record.timer); record.timer = undefined;
+    record.controller?.abort(new Error('workspace MCP connection stopped'));
+  }
+  async closeBoundary(record, boundary, token = record.token) {
+    if (record.closingBoundary === boundary && record.closing) { await record.closing; return; }
+    record.closingBoundary = boundary;
+    record.closingToken = token;
+    const closing = Promise.resolve().then(() => boundary.dispose()).catch(() => {
+      this.unsafeNames.add(record.name);
+      this.logger.warn(`workspace-mcp: ${record.name} CLOSE_UNCONFIRMED (details redacted)`);
+    });
+    record.closing = closing;
+    try { await closing; }
+    finally {
+      if (record.closing === closing) { record.closing = undefined; record.closingBoundary = undefined; }
+      if (record.closingToken === token) record.closingToken = undefined;
+    }
+  }
+  async retire(record) {
+    this.cancelRecord(record);
+    this.mounts.delete(record.name);
+    const boundary = record.boundary; record.boundary = undefined;
+    if (boundary) await this.closeBoundary(record, boundary);
+    if (record.closing) await record.closing;
+    if (record.task) await record.task;
+    this.toolFilters.delete(record.name);
+    this.serverStates.delete(record.name);
+  }
+  /** Serialized background work cannot race declaration generations or user selection. */
+  enqueue(run) {
+    const operation = this.queue.then(() => this.closed ? undefined : run());
+    this.queue = operation.catch(() => { this.logger.warn('workspace-mcp: background connection task failed (details redacted)'); });
+    return operation.finally(() => this.publish());
+  }
+  nativeEvent(record, token, event) {
+    if (event.kind === 'unsafe-close' && (this.current(record, token) || record.closingToken === token)) this.unsafeNames.add(record.name);
+    if (!this.current(record, token)) return;
+    // Never dispose from the native logger/execute call stack.
+    void this.enqueue(async () => {
+      if (!this.current(record, token)) return;
+      if (event.kind === 'unsafe-close') {
+        this.clock.clearTimeout(record.timer); record.timer = undefined;
+        if (!record.down) await this.failed(record, { code: 'CLOSE_UNCONFIRMED', retryable: false });
+        record.error = 'CLOSE_UNCONFIRMED'; record.retryable = false;
+        this.viewRecord(record, SERVER_STATES.failed, record.error);
+      }
+      else if (event.kind === 'disconnected' || event.kind === 'request-failed') {
+        await this.failed(record, { code: event.code, retryable: event.retryable !== false });
+      }
+    }).catch(() => {});
+  }
+  schedule(record) {
+    if (!this.current(record) || !record.down || record.closing || record.timer !== undefined) return;
+    if (this.unsafeNames.has(record.name)) { record.error = 'CLOSE_UNCONFIRMED'; record.retryable = false; }
+    if (!record.retryable || !this.eligible(record)) {
+      this.viewRecord(record, SERVER_STATES.failed, record.error);
+      return;
+    }
+    record.failures += 1;
+    const delay = retryDelay(record.failures, this.clock.random);
+    const token = record.token;
+    const at = this.clock.now() + delay;
+    record.timer = this.clock.setTimeout(() => {
+      record.timer = undefined;
+      void this.enqueue(() => this.current(record, token) ? this.retry(record) : undefined).catch(() => {});
+    }, delay);
+    this.viewRecord(record, SERVER_STATES.reconnecting, record.error, at);
+    // State transitions and entry into the slow lane, not an endless warning per attempt.
+    if (record.failures === 1 || record.failures === 7) this.logger.info(`workspace-mcp: ${record.name} reconnect scheduled (${record.failures === 7 ? 'slow' : 'initial'} backoff)`);
+  }
+  async failed(record, failure) {
+    if (!this.current(record) || record.down) return;
+    record.down = true;
+    if (record.connectedAt !== undefined && this.clock.now() - record.connectedAt >= STABLE_MS) record.failures = 0;
+    record.connectedAt = undefined;
+    record.error = failure.code; record.retryable = failure.retryable;
+    const boundary = record.boundary; record.boundary = undefined;
+    if (boundary) await this.closeBoundary(record, boundary);
+    if (!this.current(record)) return;
+    this.toolFilters.delete(record.name);
+    this.schedule(record);
+  }
+  async retry(record) {
+    if (!this.current(record)) return;
+    const signal = this.abort.signal;
+    let fresh;
+    try { fresh = await this.load(this.filesystem(), this.agent.session.header.cwd, this.config, { signal }); }
+    catch {
+      if (this.current(record)) { record.error = 'WORKSPACE_READ_FAILED'; this.schedule(record); }
+      return;
+    }
+    await this.refreshPolicy(fresh, signal);
+    if (!this.current(record)) return;
+    const entry = fresh.servers.find(item => item.spec.config.serverName === record.name);
+    if (!entry || !isDeepStrictEqual(entry, record.entry)) {
+      record.error = 'DECLARATION_CHANGED'; record.retryable = false;
+      this.viewRecord(record, SERVER_STATES.failed, record.error);
+      return; // Apply changed declarations at the existing safe assembly/editor boundary.
+    }
+    if (!this.eligible(record)) { this.viewRecord(record, SERVER_STATES.failed, record.error); return; }
+    // Only the decision is serialized. A slow remote initialize must not hold
+    // optional-MCP model requests or other servers' recovery behind its timeout.
+    const task = this.startRecord(record, signal, true).catch(() => {
+      this.logger.warn('workspace-mcp: recovery task failed (details redacted)');
+    }).finally(() => { this.background.delete(task); this.publish(); });
+    record.task = task;
+    this.background.add(task);
+  }
+  async startRecord(record, signal, automatic = false) {
+    if (!this.current(record)) return;
+    if (this.unsafeNames.has(record.name)) {
+      record.down = true; record.retryable = false; record.error = 'CLOSE_UNCONFIRMED';
+      this.viewRecord(record, SERVER_STATES.failed, record.error); return;
+    }
+    record.down = false;
+    record.autoAuthority = automatic || this.eligible(record);
+    record.controller = new AbortController();
+    const combined = AbortSignal.any([signal, this.abort.signal, record.controller.signal]);
+    const token = ++record.token;
+    this.viewRecord(record, automatic ? SERVER_STATES.reconnecting : SERVER_STATES.pending);
+    try {
+      await this.connectionSlot(() => this.mount(this.group, record.entry.spec, combined, record, token), combined);
+      combined.throwIfAborted();
+      if (!this.current(record, token) || record.down) return;
+      // A live profile can change while initialize waits. Never finish an automatic
+      // connection under the permission snapshot captured before that wait.
+      if (record.autoAuthority) {
+        await this.refreshPolicy(this.plan, combined);
+        if (!this.current(record, token) || record.down) return;
+        if (!this.eligible(record)) {
+          record.down = false;
+          await this.failed(record, { code: 'AUTO_CONNECT_REVOKED', retryable: false }); return;
+        }
+      }
+      record.connectedAt = this.clock.now(); record.error = undefined;
+      this.viewRecord(record, SERVER_STATES.connected);
+      if (record.failures > 0) this.logger.info(`workspace-mcp: ${record.name} reconnected`);
+    } catch (error) {
+      if (!this.current(record, token)) return;
+      await this.failed(record, error?.code === 'STARTUP_TIMEOUT'
+        ? { code: 'STARTUP_TIMEOUT', retryable: true } : classifyConnectionError(error));
+    }
+  }
   async update(signal, beforeChange) {
     if (this.closed) return;
     const combined = signal ? AbortSignal.any([signal, this.abort.signal]) : this.abort.signal;
     combined.throwIfAborted();
     const fs = this.filesystem();
     if (!fs || !this.agent.session?.header?.cwd) {
-      this.logger.warn('workspace-mcp: missing filesystem or session workspace; skipped');
-      return;
+      this.logger.warn('workspace-mcp: missing filesystem or session workspace; skipped'); return;
     }
     let plan;
-    try { plan = await this.load(fs, this.agent.session?.header.cwd, this.config, { signal: combined }); }
+    try { plan = await this.load(fs, this.agent.session.header.cwd, this.config, { signal: combined }); }
     catch (error) {
       if (combined.aborted) throw error;
-      await beforeChange?.();
-      await this.closeGroup();
-      this.loadedFingerprint = undefined;
-      this.logger.warn(`workspace-mcp: ${error.code ?? 'WORKSPACE_READ_FAILED'}`);
-      return;
+      await beforeChange?.(); await this.closeGroup(); this.loadedFingerprint = undefined;
+      this.logger.warn(`workspace-mcp: ${startupCode(error)}`); return;
     }
     this.plan = plan;
-    // The policy layer is cheap and decides both the cache key and what may start, so it is
-    // computed before the cache check rather than after it. Nothing here asks anybody for
-    // permission: a declaration loads only when the user already allowed its workspace.
-    this.trustedWorkspace = await this.isTrusted(fs, plan.cwd, combined).catch(() => false);
-    await this.loadAllowance(fs, plan.cwd, combined).catch(() => this.allowance);
-    this.policyAllowed = new Set(plan.servers
-      .map(entry => entry.spec.config.serverName)
-      .filter(name => this.canAutoConnect(name)));
-    if (this.loadKey(plan) === this.loadedFingerprint) {
+    await this.refreshPolicy(plan, combined);
+    for (const record of this.mounts.values()) {
+      if (record.timer !== undefined && !this.eligible(record)) {
+        this.clock.clearTimeout(record.timer); record.timer = undefined;
+        this.viewRecord(record, SERVER_STATES.failed, record.error);
+      } else if (record.down && record.retryable && record.timer === undefined && this.eligible(record)) this.schedule(record);
+      const live = this.serverStates.get(record.name);
+      if (live?.reconnect) live.reconnect.eligible = this.eligible(record);
+    }
+    if (this.loadKey(plan) === this.loadedFingerprint && this.retryRequested.size === 0) {
       if (this.requiredFailure) throw new Error('workspace-mcp: required server failed to start');
       return;
     }
-    // Changed/removed declarations unmount the old generation before anything new starts.
     await beforeChange?.();
-    await this.closeGroup();
-    this.loadedFingerprint = undefined; this.requiredFailure = false;
-    if (plan.diagnostics.some(issue => issue.required)) throw new Error('workspace-mcp: invalid required server declaration');
+    if (plan.diagnostics.some(issue => issue.required)) {
+      await this.closeGroup(); this.loadedFingerprint = undefined;
+      throw new Error('workspace-mcp: invalid required server declaration');
+    }
     if (plan.fingerprint !== this.diagnosticFingerprint) {
       for (const issue of plan.diagnostics) this.logger.warn(`workspace-mcp: ${JSON.stringify(issue)}`);
       this.diagnosticFingerprint = plan.fingerprint;
     }
     const selected = this.effectiveSelection(plan);
-    // Nothing authorized for this workspace: stay unloaded, silently. The panel is where a
-    // user turns a server on (connect, or the per-server allowance switch).
-    if (!selected.size) { this.loadedFingerprint = this.loadKey(plan); return; }
     const targets = plan.servers.filter(entry => selected.has(entry.spec.config.serverName));
-    combined.throwIfAborted();
+    const byName = new Map(targets.map(entry => [entry.spec.config.serverName, entry]));
+    for (const record of [...this.mounts.values()]) {
+      const entry = byName.get(record.name);
+      const force = this.retryRequested.has(record.name) && this.serverStates.get(record.name)?.state !== SERVER_STATES.connected;
+      if (record.stopped || !entry || !isDeepStrictEqual(entry, record.entry) || force) await this.retire(record);
+    }
+    this.retryRequested.clear();
+    if (!targets.length) {
+      await this.closeGroup(); this.loadedFingerprint = this.loadKey(plan); this.requiredFailure = false; return;
+    }
     if (targets.some(entry => entry.spec.includeTools !== undefined || entry.spec.excludeTools !== undefined)) this.ensureGuard();
-    this.group = this.makeBoundary(this.agent.ctx);
-    const group = this.group;
-    combined.throwIfAborted();
-    // Servers start concurrently: each already owns an independent child fiber, so one slow
-    // server no longer delays every server declared after it, and a failure still only
-    // takes its own row.
+    this.group ??= this.makeBoundary(this.agent.ctx);
     await mapLimit(targets, MOUNT_CONCURRENCY, async entry => {
       const name = entry.spec.config.serverName;
-      try {
-        await this.mount(group, entry.spec, combined);
-        this.serverStates.set(name, { state: SERVER_STATES.connected, tools: this.toolNamesFor(name) });
-      } catch (error) {
-        if (combined.aborted) return; // The abort path below closes the whole group once.
-        this.serverStates.set(name, { state: SERVER_STATES.failed, tools: [], error: startupCode(error) });
-        this.logger.warn(`workspace-mcp: SERVER_START_FAILED ${JSON.stringify(entry.source)}`);
-        if (entry.spec.required) this.requiredFailure = true;
-      }
+      if (this.mounts.has(name) || combined.aborted || this.closed) return;
+      const record = { name, entry, token: 0, failures: 0, stopped: false, down: false };
+      this.knownServers.add(name);
+      this.mounts.set(name, record);
+      await this.startRecord(record, combined);
     });
     if (combined.aborted) { await this.closeGroup(); combined.throwIfAborted(); }
     this.loadedFingerprint = this.loadKey(plan);
-    this.deniedFingerprint = undefined;
-    if (this.requiredFailure) {
-      this.loadedFingerprint = undefined; // A failed generation is not a successful cache hit.
-      await this.closeGroup();
-      throw new Error('workspace-mcp: required server failed to start');
-    }
+    this.requiredFailure = targets.some(entry => entry.spec.required && this.serverStates.get(entry.spec.config.serverName)?.state !== SERVER_STATES.connected);
+    if (this.requiredFailure) throw new Error('workspace-mcp: required server failed to start');
   }
-  async mount(group, spec, signal) {
-    // Redact the native bridge's own logging: its messages may embed spawn errors
-    // that contain an expanded credential from args/env.
+  async mount(group, spec, signal, record, token) {
+    const name = spec.config.serverName;
+    // Even unsupported bridges keep the original secret-free logging boundary.
     const redacted = () => safeLogger;
     const safeLogger = Object.assign(redacted, Object.fromEntries(['warn', 'error', 'info', 'debug'].map(level =>
-      [level, () => this.logger[level](`workspace-mcp: native ${level} (${spec.config.serverName}; details redacted)`)])));
-    // Independent child permits one failed server to roll back without affecting siblings.
+      [level, () => this.logger[level](`workspace-mcp: native ${level} (${name}; details redacted)`)])));
     const server = this.makeBoundary(group.ctx.extend({ logger: safeLogger }));
+    record.boundary = server;
     const timeoutMs = spec.startupTimeoutMs ?? this.config.startupTimeoutMs ?? 15000;
     let timer, cancel;
     try {
       if (spec.includeTools !== undefined || spec.excludeTools !== undefined) {
-        const prefix = `mcp__${spec.config.serverName}__`;
-        this.toolFilters.set(spec.config.serverName, {
-          prefix,
-          allow: spec.includeTools === undefined ? undefined : new Set(spec.includeTools.map(name => publicToolName(spec.config.serverName, name))),
-          deny: new Set((spec.excludeTools ?? []).map(name => publicToolName(spec.config.serverName, name))),
+        this.toolFilters.set(name, {
+          prefix: `mcp__${name}__`,
+          allow: spec.includeTools === undefined ? undefined : new Set(spec.includeTools.map(tool => publicToolName(name, tool))),
+          deny: new Set((spec.excludeTools ?? []).map(tool => publicToolName(name, tool))),
         });
       }
-      const fiber = server.ctx.plugin(this.nativePlugin, spec.config);
+      const plugin = this.monitoring ? createNativeAdapter(this.nativePlugin, {
+        serverName: name, logger: this.logger, onEvent: event => this.nativeEvent(record, token, event),
+      }) : this.nativePlugin;
+      const config = this.monitoring ? { ...spec.config, failOnStartupError: true, reconnect: { enabled: false } } : spec.config;
+      const fiber = server.ctx.plugin(plugin, config);
       const cancelled = new Promise((_, reject) => {
         cancel = () => reject(signal.reason ?? new Error('cancelled'));
         signal.addEventListener('abort', cancel, { once: true });
         if (signal.aborted) cancel();
-        timer = setTimeout(() => reject(new Error('startup timeout')), timeoutMs);
+        timer = this.clock.setTimeout(() => reject(Object.assign(new Error('startup timeout'), { code: 'STARTUP_TIMEOUT' })), timeoutMs);
       });
       await Promise.race([fiber.await(), cancelled]);
     } catch (error) {
-      await server.dispose();
-      this.toolFilters.delete(spec.config.serverName);
+      record.boundary = undefined;
+      await this.closeBoundary(record, server, token);
+      if (this.mounts.get(name) === record && record.token === token) this.toolFilters.delete(name);
       throw error;
     } finally {
-      clearTimeout(timer);
+      this.clock.clearTimeout(timer);
       if (cancel) signal.removeEventListener('abort', cancel);
     }
   }
   async closeGroup() {
-    const group = this.group;
-    this.group = undefined;
-    this.toolFilters.clear();
-    this.serverStates.clear();
+    const group = this.group; this.group = undefined;
+    for (const record of this.mounts.values()) this.cancelRecord(record);
+    await Promise.all([...this.mounts.values()].map(record => this.retire(record)));
+    this.toolFilters.clear(); this.serverStates.clear(); this.requiredFailure = false;
     if (group) await group.dispose();
   }
   /** Model-facing tool names this server currently publishes in the Agent scope. */
@@ -590,7 +863,11 @@ export class WorkspaceMcpSession {
     this.guardDisposer?.();
     this.guardDisposer = undefined;
     // Interrupt startup immediately; only then drain its queue.
-    this.disposing = (async () => { await this.closeGroup(); await this.queue; await this.closeGroup(); })();
+    this.disposing = (async () => {
+      await this.closeGroup(); await this.queue;
+      await Promise.allSettled([...this.background]);
+      await this.closeGroup();
+    })();
     return this.disposing;
   }
 }
@@ -599,13 +876,28 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
   if (config.enabled === false) return;
   const nativePlugin = dependencies.nativePlugin
     ?? await loadNativeBridge(ctx, dependencies.resolveLoader);
+  let nativeVersion = dependencies.nativeVersion;
+  if (nativeVersion === undefined && !dependencies.nativePlugin) {
+    try {
+      const loader = dependencies.resolveLoader?.() ?? ctx.get('loader');
+      // Loader.import's second argument is an error-stack callback, NOT import
+      // attributes. Use its own resolver and parent URL for JSON metadata too.
+      const metadata = loader.internal
+        ? await loader.internal.import('@deepseek-ai/dsh-mcp-client/package.json', loader.ctx.baseUrl, { type: 'json' })
+        : await loader.import('@deepseek-ai/dsh-mcp-client/package.json');
+      nativeVersion = (metadata.default ?? metadata).version;
+    } catch { nativeVersion = null; }
+  }
+  if (nativeVersion === undefined) nativeVersion = '0.2.0-rc.2'; // Explicit test/integration bridge.
+  if (!supportsNativeBridge(nativePlugin, nativeVersion)) ctx.logger.warn('workspace-mcp: native bridge monitoring unsupported; enhanced reconnect disabled');
   const sessions = new Map();
   let stopping = false;
   function attach(agent) {
     if (stopping) return undefined;
     let state = sessions.get(agent);
     if (!state) {
-      state = new WorkspaceMcpSession(agent, config, { logger: ctx.logger, scopeOwner: ctx, ...dependencies, nativePlugin });      sessions.set(agent, state);
+      state = new WorkspaceMcpSession(agent, config, { logger: ctx.logger, scopeOwner: ctx, ...dependencies, nativePlugin, nativeVersion });
+      sessions.set(agent, state);
       // Both Agent disposal and plugin unload own the same idempotent teardown.
       agent.ctx.effect(() => () => { sessions.delete(agent); return state.dispose(); }, 'workspace-mcp.agent');
     }
@@ -620,6 +912,14 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
     await attach(agent)?.reconcile(signal);
     return undefined;
   });
+  // Base providers run synchronously before any assembly middleware. Capture
+  // the actual registry generation here, not an already-filtered prompt later.
+  const frames = new WeakMap();
+  ctx.systemPrompt.tools(context => {
+    const state = sessions.get(context.agent ?? context.scope);
+    if (state) frames.set(context, state.assemblyFrame());
+    return { schemas: [] };
+  });
   // Assembly runs before `agent/pre-step`, so loading here makes the current
   // model request see the change instead of waiting a turn.
   ctx.on('system-prompt/assemble', async (assembly, context, next) => {
@@ -627,14 +927,19 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
     if (!agent || ctx.agents.get(agent.id) !== agent) return next();
     const state = attach(agent);
     if (!state) return next();
-    let previous;
-    await state.reconcile(context.signal,
-      async () => { previous = await baseAssembly(state.scopeOwner, context); });
-    if (previous) refreshBaseDelta(assembly, previous, await baseAssembly(state.scopeOwner, context));
+    const frame = frames.get(context) ?? state.assemblyFrame();
+    // Background recovery may move the registry after the Host's initial snapshot.
+    // Compare against that raw frame while retaining upstream visibility filters.
+    await state.reconcile(context.signal);
+    const fresh = await baseAssembly(state.scopeOwner, context);
+    state.refreshAssembly(assembly, frame, fresh);
     // Do not recurse through assemble middleware: each unrelated listener runs exactly once.
     return next();
   }, { prepend: true });
   // Existing sessions load at their next safe model-step boundary, never during a tool call.
   for (const agent of ctx.agents.list()) attach(agent);
-  return { stateFor: agent => sessions.get(agent), sessions };
+  return {
+    stateFor: agent => sessions.get(agent), sessions,
+    policyChanged: () => Promise.all([...sessions.values()].map(state => state.policyChanged().catch(() => {}))),
+  };
 }

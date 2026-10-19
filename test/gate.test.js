@@ -88,6 +88,17 @@ test('a tool the project itself forbids is never asked about', { timeout: 40000 
   assert.equal(asked.length, 1, 'the declaration already answered this');
 });
 
+test('workspace authorization never gates an inherited global tool with the same textual server prefix', { timeout: 30000 }, async t => {
+  const { ctx, a, asked } = await gated(t);
+  ctx.tools.register({ name: 'mcp__same__global_only', description: 'Global MCP contribution',
+    parameters: { type: 'object', properties: {} }, execute: () => 'global',
+    output: { schema: {}, render: (_args, value) => [{ type: 'text', text: value }] } });
+  const result = await execute(ctx, a, 'mcp__same__global_only');
+  assert.equal(result.isError, false);
+  assert.equal(result.value, 'global');
+  assert.equal(asked.length, 0);
+});
+
 test('an answer that never arrives refuses the call instead of wedging it', { timeout: 30000 }, async t => {
   const { ctx, a, asked } = await gated(t, { answers: [] });
   const refused = await execute(ctx, a, TOOL);

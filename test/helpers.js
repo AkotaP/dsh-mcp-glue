@@ -35,7 +35,7 @@ export async function harness(t) {
   // Stand in for the runtime's Cordis loader service, which the plugin uses to obtain
   // the exact native bridge instance the host composed, and to find its own entry.
   ctx.provide('loader', {
-    import: specifier => import(specifier),
+    import: specifier => specifier.endsWith('/package.json') ? import(specifier, { with: { type: 'json' } }) : import(specifier),
     unwrapExports: exports => exports?.default ?? exports,
     entries: () => [{ options: { id: 'entry-workspace-mcp-glue', name: 'dsh-mcp-glue' }, fiber: {} }],
   });

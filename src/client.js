@@ -256,6 +256,19 @@ const DICT = {
   "state.failed": ["连接失败", "Connection failed"],
   "state.invalid": ["声明有问题", "Declaration problem"],
   "state.pending": ["连接中", "Connecting"],
+  "state.reconnecting": ["重连中", "Reconnecting"],
+  "row.retryAfter": ["约 {seconds} 秒后重试 · 第 {attempt} 次", "Retry in about {seconds}s · attempt {attempt}"],
+  "action.retryNow": ["立即重试", "Retry now"],
+  "action.stopConnecting": ["停止连接", "Stop connecting"],
+  "panel.monitorUnsupported": ["当前原生桥接版本无法验证，增强重连与断线监控不可用。", "This native bridge version cannot be verified; enhanced reconnect and disconnect monitoring are unavailable."],
+  "reason.CLOSE_UNCONFIRMED": ["无法确认旧连接已关闭，请重建会话或重启 DSH", "The old connection could not be confirmed closed; recreate this session or restart DSH"],
+  "reason.AUTH_REQUIRED": ["认证被拒绝，请检查凭证后立即重试", "Authentication was rejected; check credentials, then retry"],
+  "reason.DECLARATION_CHANGED": ["声明已改变，将在下一次模型请求或编辑保存后应用", "The declaration changed; it will apply at the next model request or editor save"],
+  "reason.ENOENT": ["找不到启动程序，请检查命令后重试", "Executable not found; check the command, then retry"],
+  "reason.EACCES": ["无执行权限，请修正后重试", "Execution permission denied; correct it, then retry"],
+  "reason.EPERM": ["启动操作被禁止，请检查权限后重试", "Startup operation denied; check permissions, then retry"],
+  "reason.AUTO_CONNECT_REVOKED": ["自动连接许可已撤销", "Auto-connect permission was revoked"],
+  "reason.STARTUP_TIMEOUT": ["启动超时", "Startup timed out"],
   "state.unauthorized": ["未授权", "Unauthorized"],
   "state.unloaded": ["未加载", "Not loaded"],
   "toml.lossyWarning": ["修改 TOML 会重写整个文件，整个文件的注释和排版可能丢失；其他配置值会保留。", "Editing TOML rewrites the whole file; comments and formatting may be lost, other configuration values are kept."],
@@ -313,7 +326,8 @@ const statusSignature = status => (status === undefined ? '' : [
   status.workspace ?? '',
   status.trusted === true ? 'trusted' : 'untrusted',
   // The panel unfolds a row's tool list now, so its contents are part of the view as well.
-  ...(status.servers ?? []).map(row => `${row.id}:${row.state}:${toolNames(row).join(',')}`),
+  status.monitoring ?? '',
+  ...(status.servers ?? []).map(row => JSON.stringify([row.id, row.state, toolNames(row), row.error, row.reconnect])),
 ].join('|'));
 
 /** A read that failed (or a session not created yet) retries fast first, then doubles. */
@@ -390,7 +404,7 @@ const CSS = `
 .wmcp-dot{position:relative;display:inline-block;width:10px;height:10px;flex:none;color:var(--dsw-alias-state-idle-primary)}
 .wmcp-dot::after{content:'';position:absolute;inset:20%;border-radius:50%;background:currentColor}
 .wmcp-dot[data-state=connected]{color:var(--dsw-alias-state-success-primary)}
-.wmcp-dot[data-state=unauthorized],.wmcp-dot[data-state=unloaded]{color:var(--dsw-alias-state-warn-primary)}
+.wmcp-dot[data-state=unauthorized],.wmcp-dot[data-state=unloaded],.wmcp-dot[data-state=reconnecting]{color:var(--dsw-alias-state-warn-primary)}
 .wmcp-dot[data-state=failed],.wmcp-dot[data-state=invalid]{color:var(--dsw-alias-state-error-primary)}
 .wmcp-dot[data-state=pending]{color:var(--dsw-alias-label-tertiary)}
 /* Preset + trust page on the plugin detail page: one header, three cards, one footer. */
@@ -608,6 +622,7 @@ const STATE_LABEL = {
   unauthorized: t('state.unauthorized'),
   unloaded: t('state.unloaded'),
   pending: t('state.pending'),
+  reconnecting: t('state.reconnecting'),
 };
 
 /** One state dot; the CSS paints the host's four state colours from `data-state`. */
@@ -618,7 +633,7 @@ function dotElement(state, key) {
 /** Panel row states that force the chip red: a broken declaration or a failed start. */
 const CHIP_ERROR_STATES = new Set(['failed', 'invalid']);
 /** Panel row states that force the chip amber: declared, but not connected. */
-const CHIP_WARN_STATES = new Set(['unauthorized', 'unloaded']);
+const CHIP_WARN_STATES = new Set(['unauthorized', 'unloaded', 'reconnecting']);
 
 /**
  * Chip text, dot state and accessible name for one host status payload.
@@ -734,6 +749,7 @@ function Chip(props) {
   /** The panel element, so a pointer outside both it and the chip can dismiss it. */
   const panel = React.useRef(null);
   const alive = React.useRef(true);
+  const actionSequence = React.useRef(0);
   /** Signature of the last read, and whether it differed: the chip follows row changes. */
   const signature = React.useRef('');
   const changing = React.useRef(false);
@@ -854,14 +870,15 @@ function Chip(props) {
   }, [open]);
 
   const act = async (name, serverId) => {
+    const sequence = ++actionSequence.current;
     setBusy(`${name}:${serverId ?? ''}`);
     try {
       const next = await request(`/${name}`, serverId === undefined ? { sessionId } : { sessionId, serverId });
-      if (alive.current) { setStatus(next); setError(undefined); }
+      if (alive.current && actionSequence.current === sequence) { setStatus(next); setError(undefined); }
     } catch (reason) {
-      if (alive.current) setError(reason instanceof Error ? reason.message : String(reason));
+      if (alive.current && actionSequence.current === sequence) setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      if (alive.current) setBusy(undefined);
+      if (alive.current && actionSequence.current === sequence) setBusy(undefined);
     }
   };
 
@@ -1139,6 +1156,7 @@ function Chip(props) {
 
   const body = [];
   if (error !== undefined) body.push(React.createElement('p', { key: 'error', className: 'wmcp-note', 'data-kind': 'error' }, error));
+  if (status?.monitoring === 'unsupported') body.push(React.createElement('p', { key: 'monitoring', className: 'wmcp-note' }, t('panel.monitorUnsupported')));
   if (status === undefined) body.push(React.createElement('p', { key: 'loading', className: 'wmcp-note' }, t('panel.reading')));
   else if (rows.length === 0) body.push(React.createElement('p', { key: 'empty', className: 'wmcp-note' }, t('panel.empty')));
   else body.push(...rows.map(row => React.createElement(ServerRow, {
@@ -1327,11 +1345,24 @@ function TrustSwitch({ checked, disabled, label, hint, onToggle }) {
  * `allowTools` stores, so nothing here rewrites one. A server that is not mounted reports no
  * tools at all, so an empty list is the hint to connect first rather than an empty box.
  */
+function RetryCountdown({ nextRetryAt, attempt }) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [nextRetryAt]);
+  return React.createElement('span', { className: 'wmcp-tools-hint' },
+    t('row.retryAfter', { seconds: Math.max(0, Math.ceil((nextRetryAt - now) / 1000)), attempt }));
+}
+
 function ServerRow(props) {
   const { row, allowance, expanded, busy, trusted, writable, onToggleAllow, onToggleTool, onToggleExpand, onAct, onEdit, showPolicy = true } = props;
   const tools = toolNames(row);
   const allowed = (allowance?.allowMcp ?? []).includes(row.id);
   const connected = row.state === 'connected';
+  const connecting = row.state === 'pending' || row.state === 'reconnecting';
+  const canStop = connecting && (busy === undefined || busy === `connect:${row.id}` || busy === 'connect:');
   const rowChildren = [
     dotElement(row.state, 'dot'),
     React.createElement(onEdit === undefined ? 'span' : 'button', {
@@ -1369,16 +1400,27 @@ function ServerRow(props) {
     ]),
     actionButton({
       key: 'act',
-      disabled: busy !== undefined || row.state === 'invalid',
+      disabled: (!canStop && busy !== undefined) || row.state === 'invalid' || row.error === 'CLOSE_UNCONFIRMED',
       title: row.state === 'invalid' ? t('row.unconvertible') : undefined,
-      onClick: () => onAct(connected ? 'disconnect' : 'connect'),
-    }, busy !== undefined ? '…' : connected ? t('action.disconnect') : t('action.connect')),
+      onClick: () => onAct(connected || connecting ? 'disconnect' : 'connect'),
+    }, busy !== undefined && !canStop ? '…' : connected ? t('action.disconnect') : connecting ? t('action.stopConnecting') : row.state === 'failed' ? t('action.retryNow') : t('action.connect')),
+    connecting ? actionButton({
+      key: 'retry', disabled: busy !== undefined || row.error === 'CLOSE_UNCONFIRMED',
+      onClick: () => onAct('connect'),
+    }, t('action.retryNow')) : null,
     onEdit === undefined ? null : actionButton({
       key: 'edit', 'aria-label': t('row.manageAria', { id: row.id }), title: t('row.manageHint'),
       disabled: busy !== undefined, onClick: () => onEdit(row.id),
     }, '⋯'),
   ];
   const children = [React.createElement('div', { key: 'row', className: 'wmcp-row' }, rowChildren)];
+  if (row.state === 'reconnecting' && Number.isFinite(row.reconnect?.nextRetryAt)) {
+    children.push(React.createElement(RetryCountdown, { key: 'countdown', nextRetryAt: row.reconnect.nextRetryAt, attempt: row.reconnect.attempt }));
+  }
+  if (row.error !== undefined) {
+    const translated = ['CLOSE_UNCONFIRMED', 'AUTH_REQUIRED', 'DECLARATION_CHANGED', 'ENOENT', 'EACCES', 'EPERM', 'AUTO_CONNECT_REVOKED', 'STARTUP_TIMEOUT'].includes(row.error);
+    children.push(React.createElement('span', { key: 'reason', className: 'wmcp-tools-hint' }, translated ? t(`reason.${row.error}`) : row.error));
+  }
   if (expanded) {
     children.push(React.createElement('div', { key: 'tools', className: 'wmcp-tools' },
       tools.length === 0

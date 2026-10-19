@@ -88,7 +88,7 @@ function unavailableReason(service, rowId) {
  * limits are never round-tripped from the browser; the preset payload is validated with
  * the same resolver the loader uses, so a broken preset never reaches disk.
  */
-export function createConfigControl({ settings, loader, packageNames, fallback }) {
+export function createConfigControl({ settings, loader, packageNames, fallback, onChange }) {
   const names = new Set(packageNames);
   const rowId = () => {
     const registry = loader();
@@ -152,6 +152,7 @@ export function createConfigControl({ settings, loader, packageNames, fallback }
       if (Object.keys(next).length === 0) throw new Error('没有要保存的改动');
       resolvePresets({ ...fallback(), ...next }); // Reject a config that would break activation.
       await service.update(found.ns, next, found.revision);
+      await onChange?.();
       return read();
     },
     /**
@@ -182,6 +183,7 @@ export function createConfigControl({ settings, loader, packageNames, fallback }
         ? [...rest, proposed]
         : rest;
       await service.update(found.ns, { workspaceAllowances: next }, found.revision);
+      await onChange?.();
       return read();
     },
   };

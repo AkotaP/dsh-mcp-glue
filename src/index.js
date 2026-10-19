@@ -110,6 +110,7 @@ export async function apply(ctx, config) {
     loader: () => services.loader,
     packageNames: [packageName, name],
     fallback: () => live,
+    onChange: () => loader.policyChanged(),
   });
   // ── Tool gate ────────────────────────────────────────────────────────────────────
   // Loading a server and calling one of its tools are separate decisions. A tool from a
@@ -144,6 +145,9 @@ export async function apply(ctx, config) {
     if (state === undefined || typeof exec.name !== 'string' || !exec.name.startsWith('mcp__')) return next();
     // Leave every global or sibling-plugin MCP alone: only this session's own mounts are ours.
     if (![...state.mountedServers()].some(server => exec.name.startsWith(`mcp__${server}__`))) return next();
+    // During recovery an inherited global definition may become visible beneath
+    // the removed scoped registration. A textual namespace alone does not own it.
+    if (ctx.tools.get(exec.name, exec.agent) === ctx.tools.get(exec.name)) return next();
     if (state.canInvokeWithoutApproval(exec.name) || unconfined(exec)) return next();
     // The project can forbid its own tools, and that prohibition is enforced by a guard after
     // this gate — a guard can only deny, so the question would have no honest answer. Skip it

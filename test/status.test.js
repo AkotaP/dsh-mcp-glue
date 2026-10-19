@@ -55,8 +55,10 @@ test('declaration errors and failed startups are reported per server', { timeout
   assert.equal(byId.get('broken').error, 'UNSUPPORTED_AUTH_OR_POLICY');
   assert.equal(byId.get('missing').state, 'invalid');
   assert.equal(byId.get('missing').error, 'MISSING_ENVIRONMENT_VARIABLE');
-  assert.equal(byId.get('dead').state, 'failed');
-  assert.equal(byId.get('dead').error, 'START_FAILED');
+  assert.equal(byId.get('dead').state, 'reconnecting');
+  assert.equal(byId.get('dead').reconnect.eligible, true);
+  assert.ok(Number.isFinite(byId.get('dead').reconnect.nextRetryAt));
+  assert.equal(byId.get('dead').error, 'CONNECTION_CLOSED');
   assert.equal(byId.get('good').state, 'connected');
   assert.equal(status.counts.connected, 1);
   assert.equal(status.counts.problems, 3);
