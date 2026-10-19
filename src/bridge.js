@@ -1,5 +1,12 @@
-/** Compatibility boundary for the host's exact native MCP module (never import a second copy). */
-const NATIVE_VERSION = '0.2.0-rc.2';
+/**
+ * Releases whose lifecycle wording was read and confirmed to match the strings below.
+ *
+ * A version outside this set is not refused: the adapter's real dependencies are proved
+ * against the loaded module instead (see {@link supportsNativeBridge}). Pinning to a single
+ * release made a routine Host upgrade silently disable every enhanced feature, which is a
+ * worse failure than an unverified-but-capability-proven module.
+ */
+const VERIFIED_VERSIONS = new Set(['0.2.0-rc.2', '0.2.1-rc.2']);
 const CAUSE_LIMIT = 8;
 const NETWORK_CODES = new Set([
   'ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ENOTFOUND',
@@ -80,18 +87,26 @@ function hasAdaptedCapabilities(nativePlugin) {
 }
 
 /**
- * Whether this module may be adapted.
+ * Whether this module may be adapted, and how confidently.
  *
- * A known version must match exactly: the log wording the adapter listens for is verified
- * only against that release. When the version cannot be read at all (`null`) the adapter
- * falls back to proving the capabilities directly, so a working install is never disabled
- * just because the Host's loader cannot hand out package metadata.
+ * @param nativePlugin - the module namespace the Host loader returned.
+ * @param version - its package version, or null when the Host loader would not say.
+ * @returns `'verified'` when the release is one whose wording was read; `'capabilities'`
+ *   when an unverified release still proves the two capabilities the adapter needs;
+ *   `undefined` when it cannot be adapted at all.
  */
+export function nativeBridgeSupport(nativePlugin, version) {
+  if (!hasBridgeShape(nativePlugin)) return undefined;
+  if (VERIFIED_VERSIONS.has(version)) return 'verified';
+  // Unknown or newer release: prove what the adapter actually depends on. The wording it
+  // listens for is the one unprovable part, so an accepted upgrade is reported honestly
+  // and the version-independent paths (probes, typed request errors) still carry detection.
+  return hasAdaptedCapabilities(nativePlugin) ? 'capabilities' : undefined;
+}
+
+/** Convenience predicate for callers that only need a yes/no answer. */
 export function supportsNativeBridge(nativePlugin, version) {
-  if (!hasBridgeShape(nativePlugin)) return false;
-  if (version === NATIVE_VERSION) return true;
-  if (version === null) return hasAdaptedCapabilities(nativePlugin);
-  return false;
+  return nativeBridgeSupport(nativePlugin, version) !== undefined;
 }
 
 // Copy descriptors, symbols, prototype and ALL definition fields (notably projectContent).

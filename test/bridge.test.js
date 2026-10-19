@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import * as NativeMcp from '@deepseek-ai/dsh-mcp-client';
 import { scopeOf } from '@deepseek-ai/dsh-scope';
 import { agent, harness } from './helpers.js';
-import { createNativeAdapter, classifyConnectionError, supportsNativeBridge } from '../src/bridge.js';
+import { createNativeAdapter, classifyConnectionError, nativeBridgeSupport, supportsNativeBridge } from '../src/bridge.js';
 
 // Use the SDK resolved BY the installed native module, not another bundled copy.
 const require = createRequire(import.meta.url);
@@ -32,18 +32,23 @@ const definition = (name, execute) => ({
   output: { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] }, execute,
 });
 
-test('compatibility is explicit and pinned to the verified native release', () => {
-  assert.equal(supportsNativeBridge(NativeMcp, '0.2.0-rc.2'), true);
-  for (const version of [undefined, '0.2.0', '0.2.0-rc.1', '0.2.0-rc.3', 'v0.2.0-rc.2', '0.2.0-rc.2+build']) {
-    assert.equal(supportsNativeBridge(NativeMcp, version), false);
+test('a verified release is trusted by version, any other by proven capabilities', () => {
+  for (const version of ['0.2.0-rc.2', '0.2.1-rc.2']) {
+    assert.equal(nativeBridgeSupport(NativeMcp, version), 'verified');
+    assert.equal(supportsNativeBridge(NativeMcp, version), true);
   }
+  // An upgraded or unreadable version must not disable the feature: the two capabilities
+  // the adapter really needs are proved against the loaded module instead.
+  for (const version of [null, undefined, '0.2.0-rc.3', '0.2.2-rc.1', 'v0.2.0-rc.2']) {
+    assert.equal(nativeBridgeSupport(NativeMcp, version), 'capabilities');
+    assert.equal(supportsNativeBridge(NativeMcp, version), true);
+  }
+  // Shape or capability gaps are still refusals.
   for (const plugin of [undefined, {}, { apply() {} }, { ...NativeMcp, inject: [] }]) {
     assert.equal(supportsNativeBridge(plugin, '0.2.0-rc.2'), false);
   }
-  // An unreadable version is not a refusal: the adapter proves its two capabilities
-  // instead, so a working install is never disabled by a loader that hides metadata.
-  assert.equal(supportsNativeBridge(NativeMcp, null), true, 'the installed release carries reconnect config and tool definitions');
-  for (const plugin of [undefined, {}, { ...NativeMcp, createMcpToolDefinition: undefined }, { ...NativeMcp, Config: undefined }]) {
+  for (const plugin of [{ ...NativeMcp, createMcpToolDefinition: undefined }, { ...NativeMcp, Config: undefined }]) {
+    assert.equal(nativeBridgeSupport(plugin, null), undefined);
     assert.equal(supportsNativeBridge(plugin, null), false);
   }
 });

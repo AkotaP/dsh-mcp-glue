@@ -3,7 +3,7 @@ import { createDeclarationEditor } from './edit.js';
 import { loadWorkspace } from './load.js';
 import { publicToolName } from './normalize.js';
 import { SERVER_STATES, buildStatus } from './status.js';
-import { createNativeAdapter, classifyConnectionError, supportsNativeBridge } from './bridge.js';
+import { createNativeAdapter, classifyConnectionError, nativeBridgeSupport } from './bridge.js';
 import { realClock, retryDelay, STABLE_MS, createConnectionLimiter } from './retry.js';
 import { HEALTH, probeHttp, probeTarget } from './health.js';
 
@@ -111,7 +111,7 @@ export class WorkspaceMcpSession {
     this.healthEnabled = health !== false;
     /** Last time this session did anything MCP-shaped: it gates the probe cadence. */
     this.lastActivityAt = clock.now();
-    this.monitoring = supportsNativeBridge(nativePlugin, nativeVersion);
+    this.monitoring = nativeBridgeSupport(nativePlugin, nativeVersion) !== undefined;
     this.mounts = new Map();
     this.knownServers = new Set();
     this.background = new Set();
@@ -1070,10 +1070,13 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
     nativeVersion = loader === undefined ? null : await detectNativeVersion(loader, ctx.logger);
   }
   if (nativeVersion === undefined) nativeVersion = '0.2.0-rc.2'; // Explicit test/integration bridge.
-  if (!supportsNativeBridge(nativePlugin, nativeVersion)) {
-    ctx.logger.warn(`workspace-mcp: native bridge monitoring unsupported (${String(nativeVersion)}); enhanced reconnect disabled`);
-  } else if (nativeVersion === null) {
-    ctx.logger.info('workspace-mcp: native bridge version unverified; capabilities confirmed, monitoring enabled');
+  const support = nativeBridgeSupport(nativePlugin, nativeVersion);
+  if (support === undefined) {
+    ctx.logger.warn(`workspace-mcp: native bridge cannot be adapted (version ${String(nativeVersion)}); enhanced reconnect disabled`);
+  } else if (support === 'capabilities') {
+    // Say it out loud once: disconnect wording is the one thing not verified here, so the
+    // version-independent detection (probes, typed request errors) is what carries this case.
+    ctx.logger.warn(`workspace-mcp: native bridge version ${String(nativeVersion)} unverified; capabilities confirmed, monitoring enabled`);
   }
   const sessions = new Map();
   let stopping = false;

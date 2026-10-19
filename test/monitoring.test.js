@@ -101,9 +101,10 @@ test('refresh preserves upstream MCP visibility filters, including unrelated glo
   assert.ok(ctx.tools.get('read_mcp_resource', owner), 'global registration remains intact');
 });
 
-test('a different known native version is refused, while unreadable metadata falls back to capability proof', async t => {
-  for (const version of ['0.2.0-rc.3', undefined]) {
-    const ctx = await harness(t), owner = agent(ctx, process.cwd(), `unsupported-${version}`);
+test('an upgraded or unreadable version is adapted on proven capabilities, a bare module is refused', async t => {
+  // An upgraded Host must not silently disable the feature: capabilities decide.
+  for (const version of ['0.2.0-rc.3', '0.2.1-rc.2', undefined]) {
+    const ctx = await harness(t), owner = agent(ctx, process.cwd(), `upgraded-${version}`);
     ctx.agents.enter(owner, undefined);
     const loader = {
       import: async specifier => {
@@ -113,15 +114,18 @@ test('a different known native version is refused, while unreadable metadata fal
       },
       unwrapExports: value => value,
     };
-    const installed = await installWorkspaceLoader(ctx, {}, { resolveLoader: () => loader });
+    const installed = await installWorkspaceLoader(ctx, {}, { resolveLoader: () => loader, health: false });
     const state = installed.stateFor(owner);
-    if (version === undefined) {
-      // Metadata is a diagnostic, not the gate: the adapter's two capabilities decide.
-      assert.equal(state.monitoring, true);
-      assert.equal((await state.status()).monitoring, 'supported');
-    } else {
-      assert.equal(state.monitoring, false);
-      assert.equal((await state.status()).monitoring, 'unsupported');
-    }
+    assert.equal(state.monitoring, true, `version ${String(version)} still proves the adapter's capabilities`);
+    assert.equal((await state.status()).monitoring, 'supported');
   }
+
+  // A module that cannot accept reconnect config is genuinely unadaptable, whatever it claims.
+  const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'bare-module');
+  ctx.agents.enter(owner, undefined);
+  const bare = { name: 'mcp-client', inject: ['tools'], async apply() {} };
+  const installed = await installWorkspaceLoader(ctx, {}, { nativePlugin: bare, nativeVersion: '9.9.9', health: false });
+  const state = installed.stateFor(owner);
+  assert.equal(state.monitoring, false);
+  assert.equal((await state.status()).monitoring, 'unsupported');
 });
