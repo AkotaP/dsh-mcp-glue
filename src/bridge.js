@@ -54,11 +54,44 @@ export function classifyConnectionError(error) {
   catch { return { code: 'START_FAILED', retryable: true }; }
 }
 
-/** Log wording and registration seams below have only been verified against this exact native release. */
-export function supportsNativeBridge(nativePlugin, version) {
-  return version === NATIVE_VERSION && nativePlugin?.name === 'mcp-client'
+/** The module shape every supported release shares: one plugin instance per server. */
+function hasBridgeShape(nativePlugin) {
+  return nativePlugin?.name === 'mcp-client'
     && typeof nativePlugin.apply === 'function' && Array.isArray(nativePlugin.inject)
     && nativePlugin.inject.includes('tools');
+}
+
+/**
+ * The two native capabilities this adapter actually depends on, proved against the
+ * loaded module instead of a version string.
+ *
+ * `reconnect` must survive its schema (that is what the adapter turns off), and the
+ * module must still create tool definitions. A release without them cannot be adapted
+ * however its package.json reads.
+ */
+function hasAdaptedCapabilities(nativePlugin) {
+  try {
+    const resolved = new nativePlugin.Config({
+      serverName: 'workspace-mcp-probe', transport: 'stdio', command: 'node', args: [],
+      reconnect: { enabled: false },
+    });
+    return resolved?.reconnect?.enabled === false && typeof nativePlugin.createMcpToolDefinition === 'function';
+  } catch { return false; }
+}
+
+/**
+ * Whether this module may be adapted.
+ *
+ * A known version must match exactly: the log wording the adapter listens for is verified
+ * only against that release. When the version cannot be read at all (`null`) the adapter
+ * falls back to proving the capabilities directly, so a working install is never disabled
+ * just because the Host's loader cannot hand out package metadata.
+ */
+export function supportsNativeBridge(nativePlugin, version) {
+  if (!hasBridgeShape(nativePlugin)) return false;
+  if (version === NATIVE_VERSION) return true;
+  if (version === null) return hasAdaptedCapabilities(nativePlugin);
+  return false;
 }
 
 // Copy descriptors, symbols, prototype and ALL definition fields (notably projectContent).

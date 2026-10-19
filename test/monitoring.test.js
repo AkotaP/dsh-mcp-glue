@@ -101,7 +101,7 @@ test('refresh preserves upstream MCP visibility filters, including unrelated glo
   assert.ok(ctx.tools.get('read_mcp_resource', owner), 'global registration remains intact');
 });
 
-test('unknown native versions or unavailable metadata downgrade enhanced monitoring explicitly', async t => {
+test('a different known native version is refused, while unreadable metadata falls back to capability proof', async t => {
   for (const version of ['0.2.0-rc.3', undefined]) {
     const ctx = await harness(t), owner = agent(ctx, process.cwd(), `unsupported-${version}`);
     ctx.agents.enter(owner, undefined);
@@ -115,7 +115,13 @@ test('unknown native versions or unavailable metadata downgrade enhanced monitor
     };
     const installed = await installWorkspaceLoader(ctx, {}, { resolveLoader: () => loader });
     const state = installed.stateFor(owner);
-    assert.equal(state.monitoring, false);
-    assert.equal((await state.status()).monitoring, 'unsupported');
+    if (version === undefined) {
+      // Metadata is a diagnostic, not the gate: the adapter's two capabilities decide.
+      assert.equal(state.monitoring, true);
+      assert.equal((await state.status()).monitoring, 'supported');
+    } else {
+      assert.equal(state.monitoring, false);
+      assert.equal((await state.status()).monitoring, 'unsupported');
+    }
   }
 });

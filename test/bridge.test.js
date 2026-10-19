@@ -40,6 +40,12 @@ test('compatibility is explicit and pinned to the verified native release', () =
   for (const plugin of [undefined, {}, { apply() {} }, { ...NativeMcp, inject: [] }]) {
     assert.equal(supportsNativeBridge(plugin, '0.2.0-rc.2'), false);
   }
+  // An unreadable version is not a refusal: the adapter proves its two capabilities
+  // instead, so a working install is never disabled by a loader that hides metadata.
+  assert.equal(supportsNativeBridge(NativeMcp, null), true, 'the installed release carries reconnect config and tool definitions');
+  for (const plugin of [undefined, {}, { ...NativeMcp, createMcpToolDefinition: undefined }, { ...NativeMcp, Config: undefined }]) {
+    assert.equal(supportsNativeBridge(plugin, null), false);
+  }
 });
 
 test('startup classification reads bounded structured causes, never error-message substrings', () => {

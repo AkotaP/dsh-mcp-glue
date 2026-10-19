@@ -1024,24 +1024,57 @@ export class WorkspaceMcpSession {
   }
 }
 
+/**
+ * Read the native bridge's own version through the Host loader.
+ *
+ * The loader exposes two different import paths and only one of them can carry JSON
+ * attributes, so every reasonable spelling is tried before giving up. Returning `null`
+ * means "unknown", which the capability check then decides — it never means "unsupported".
+ * @returns the version string, or null when no route produced one.
+ */
+async function detectNativeVersion(loader, logger) {
+  const pkg = '@deepseek-ai/dsh-mcp-client/package.json';
+  const versionOf = value => (value?.default ?? value)?.version;
+  const read = async run => {
+    const version = versionOf(await run());
+    return typeof version === 'string' && version.length > 0 ? version : undefined;
+  };
+  const attempts = [];
+  const tryRead = async run => {
+    try { return await read(run); }
+    catch (error) { attempts.push(typeof error?.code === 'string' ? error.code : 'IMPORT_FAILED'); return undefined; }
+  };
+  const baseUrl = loader?.ctx?.baseUrl;
+  const internal = loader?.internal;
+  if (internal !== undefined) {
+    // Node's internal loader takes attributes directly; both spellings have shipped.
+    for (const attributes of [{ type: 'json' }, { with: { type: 'json' } }]) {
+      const version = await tryRead(() => internal.import(pkg, baseUrl, attributes));
+      if (version !== undefined) return version;
+    }
+  }
+  const version = await tryRead(() => loader.import(pkg));
+  if (version !== undefined) return version;
+  logger?.warn?.(`workspace-mcp: native bridge metadata unavailable (${[...new Set(attempts)].join(',') || 'NO_LOADER'}); verifying capabilities instead`);
+  return null;
+}
+
 export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
   if (config.enabled === false) return;
   const nativePlugin = dependencies.nativePlugin
     ?? await loadNativeBridge(ctx, dependencies.resolveLoader);
   let nativeVersion = dependencies.nativeVersion;
   if (nativeVersion === undefined && !dependencies.nativePlugin) {
-    try {
-      const loader = dependencies.resolveLoader?.() ?? ctx.get('loader');
-      // Loader.import's second argument is an error-stack callback, NOT import
-      // attributes. Use its own resolver and parent URL for JSON metadata too.
-      const metadata = loader.internal
-        ? await loader.internal.import('@deepseek-ai/dsh-mcp-client/package.json', loader.ctx.baseUrl, { type: 'json' })
-        : await loader.import('@deepseek-ai/dsh-mcp-client/package.json');
-      nativeVersion = (metadata.default ?? metadata).version;
-    } catch { nativeVersion = null; }
+    let loader;
+    try { loader = dependencies.resolveLoader?.() ?? ctx.get('loader'); } catch { loader = undefined; }
+    nativeVersion = loader === undefined ? null : await detectNativeVersion(loader, ctx.logger);
   }
   if (nativeVersion === undefined) nativeVersion = '0.2.0-rc.2'; // Explicit test/integration bridge.
-  if (!supportsNativeBridge(nativePlugin, nativeVersion)) ctx.logger.warn('workspace-mcp: native bridge monitoring unsupported; enhanced reconnect disabled');
+  if (!supportsNativeBridge(nativePlugin, nativeVersion)) {
+    ctx.logger.warn(`workspace-mcp: native bridge monitoring unsupported (${String(nativeVersion)}); enhanced reconnect disabled`);
+  } else if (nativeVersion === null) {
+    ctx.logger.info('workspace-mcp: native bridge version unverified; capabilities confirmed, monitoring enabled');
+  }
   const sessions = new Map();
   let stopping = false;
   function attach(agent) {
