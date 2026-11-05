@@ -6,6 +6,7 @@ import { SERVER_STATES, buildStatus } from './status.js';
 import { createNativeAdapter, classifyConnectionError, nativeBridgeSupport } from './bridge.js';
 import { realClock, retryDelay, STABLE_MS, createConnectionLimiter } from './retry.js';
 import { HEALTH, probeHttp, probeTarget } from './health.js';
+import { installToolPreparation } from './step.js';
 
 /**
  * Registration boundary used for one configuration generation.
@@ -1111,6 +1112,17 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
     await attach(agent)?.reconcile(signal);
     return undefined;
   });
+  // 0.2.2 fixes the step's executable tool set before assembling its prompt.
+  // Reconcile before that admission, not by adding schemas to a text waterfall.
+  installToolPreparation(ctx, async ({ agent, signal }) => {
+    if (!agent || ctx.agents.get(agent.id) !== agent) return;
+    const state = attach(agent);
+    if (!state) return;
+    signal?.throwIfAborted();
+    state.noteActivity();
+    await state.reconcile(signal);
+    signal?.throwIfAborted();
+  });
   // Base providers run synchronously before any assembly middleware. Capture
   // the actual registry generation here, not an already-filtered prompt later.
   const frames = new WeakMap();
@@ -1124,6 +1136,10 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
   ctx.on('system-prompt/assemble', async (assembly, context, next) => {
     const agent = context.agent ?? context.scope;
     if (!agent || ctx.agents.get(agent.id) !== agent) return next();
+    // 0.2.2's waterfall has no tools. Native providers own schemas (including
+    // PTC/executor projections); leave the already admitted snapshot untouched.
+    // Older Hosts still need the legacy delta refresh below.
+    if (!Array.isArray(assembly.tools)) return next();
     const state = attach(agent);
     if (!state) return next();
     // A model request is the moment the tool set is about to be used: keep the heartbeat

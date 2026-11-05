@@ -2,7 +2,13 @@
 
 [中文](README.md) | English
 
-Loads project-level MCP declarations for **DeepSeek Harness 0.2.1-rc.2** (offline test baseline `0.2.0-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
+Loads project-level MCP declarations for **DeepSeek Harness 0.2.2-rc.1** (retaining compatibility paths for `0.2.0-rc.2` / `0.2.1-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
+
+## 0.3.1: DSH 0.2.2 compatibility fix
+
+0.2.2 fixes executable tools before prompt assembly; the `system-prompt/assemble` waterfall no longer contains `tools`. This plugin reconciles workspace MCP before native `tools.resolve()` admission, only for its own Agents, retaining native conditions, executor projection and cancellation. The adapter is restored on unload. The new text waterfall never reads or rewrites tools; older Hosts retain delta refresh. Defaulting the missing field to an empty array would hide the crash but would not admit new tools into the current executable snapshot.
+
+Fixes sessions failing with `Cannot read properties of undefined (reading 'flatMap')` after upgrading DSH. Verified with 12 targeted regressions and the actual 0.2.2-rc.1 services (empty workspace, same-step declaration add/change/remove, and unload restoration). On 2026-11-05 the user confirmed normal operation after re-enabling the plugin. Reload the plugin after updating host code, or restart DSH if hot recomposition is unavailable.
 
 ## Built-in presets
 
@@ -25,7 +31,7 @@ Two seats:
 
 The client half registers its copy as `ctx.locale` dictionaries under the package name, so the panel and the plugin page follow the GUI language (Chinese or English). Without the locale service the zh column is used.
 
-The contract, security boundaries and activation rules are in the [management UI document](<docs/management-ui.md>). The client half is the repository's build artifact `lib/client.js` (generated from `src/client.js` by `pnpm run build`); it must be built or the Host reports a missing bundle and refuses to activate. Run `pnpm run build` after changing the client source. Whether the running Host picks up the new bundle automatically depends on its development watcher, so an open page alone proves nothing. **Host**-half changes require a DSH restart, because the process keeps the module it imported at activation time.
+The contract, security boundaries and activation rules are in the [management UI document](<docs/management-ui.md>). The client half is the repository's build artifact `lib/client.js` (generated from `src/client.js` by `pnpm run build`); it must be built or the Host reports a missing bundle and refuses to activate. Run `pnpm run build` after changing the client source. Whether the running Host picks up the new bundle automatically depends on its development watcher, so an open page alone proves nothing. **Host**-half changes require profile hot recomposition to re-import modules; restart DSH if hot recomposition is unavailable or the change has not taken effect.
 
 ## Auto reconnect
 
@@ -36,7 +42,7 @@ The contract, security boundaries and activation rules are in the [management UI
 - **Drop detection**: connected HTTP servers are probed read-only (`HEAD`, 1.5 s timeout, no credentials; any HTTP response counts as alive). The first failure withdraws the green dot and shows "Unverified", re-checked after 1.2 s; only two consecutive failures hand the server to the reconnect supervisor, while any real successful call renews the confirmation. Cadence follows activity: 10 s while MCP work happens, 30 s after two minutes, and it stops after five idle minutes. Opening the panel and calling a tool whose confirmation is older than 5 s probe immediately; an unreachable endpoint then fails that call with a clear reason instead of waiting out the tool timeout, and the call is never replayed. `stdio` relies on the child-exit event and is not probed.
 - Failed tools are never replayed; there is no UnityEditor server-startup automation. A typed call error identifying an HTTP session 404 schedules fresh initialization under backoff, without replaying that call.
 
-See the [management UI reconnect contract](<docs/management-ui.md#auto-reconnect>) for details. Verification so far covers backend checks and the client build only, **not live deployment verification**. Host source changes require an actual Harness restart, not toggling the plugin row or assuming HMR.
+See the [management UI reconnect contract](<docs/management-ui.md#auto-reconnect>) for details. See the compatibility fix above for 0.3.1 targeted verification and the user-confirmed running deployment after re-enabling. This does not imply live verification of every reconnect or GUI scenario.
 
 ## Install
 
@@ -48,7 +54,7 @@ Any one of three paths. All of them place the package in the profile's `node_mod
   # pin a commit: 'github:<owner>/dsh-mcp-glue#<sha>'
   ```
   This path needs no build step: `lib/client.js` is committed, and `prepack` runs only for local packaging (DSH executes `pnpm add <spec>`, which does not run the pack lifecycle). The repository has no install-time script, so no dependency build script ever waits for approval.
-- **Link install (recommended while iterating)**: link the profile to this directory without repacking each time. Rebuild client source changes and confirm the Host loads the new bundle; Host source changes require an actual Harness restart (reloading the plugin row does not re-import modules).
+- **Link install (recommended while iterating)**: link the profile to this directory without repacking each time. Rebuild client source changes and confirm the Host loads the new bundle; trigger profile hot recomposition after Host source changes and confirm activation, restarting Harness if unavailable or ineffective.
   ```powershell
   # run in the profile directory; the spec points at this project
   pnpm add link:<absolute path to this project>
@@ -57,7 +63,7 @@ Any one of three paths. All of them place the package in the profile's `node_mod
 
 Runtime code deliberately imports **no** `@deepseek-ai/dsh-*` module: scope identity lives in module-private symbols, and a second copy of those modules turns scoped registrations into global ones. The native MCP bridge is obtained from the Host Cordis loader, which loads the instance the runtime itself uses (see the [investigation notes](<docs/loading-model.md#6-模块实例身份第三方插件的关键约束>)).
 
-`peerDependencies` declares only `@deepseek-ai/dsh: >=0.2.0-rc.2`, marked optional: DSH uses it for version compatibility at install and startup (it recognizes only the `@deepseek-ai/dsh` and `@deepseek-ai/dsh-*` prefixes) and refuses or warns when it is not satisfied. Marking it optional keeps pnpm from installing it and keeps it out of runtime imports. `engines.dsh` is documentation only and is not read at runtime.
+`peerDependencies` declares only `@deepseek-ai/dsh: >=0.2.0-rc.2`, marked optional: DSH uses it for version compatibility at install and startup (it recognizes only the `@deepseek-ai/dsh` and `@deepseek-ai/dsh-*` prefixes) and refuses or warns when it is not satisfied. Marking it optional keeps pnpm from installing it and keeps it out of runtime imports. DSH 0.2.1+ actually validates `engines.dsh`; the peer declaration above covers compatibility checks on 0.2.0.
 
 Development and packaging (use Node 22.16+ for `node`/`pnpm`):
 

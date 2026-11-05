@@ -4,6 +4,8 @@
 
 > **0.2.1-rc.2 复核**：本机随后升级到 DSH `0.2.1-rc.2`（`@deepseek-ai/dsh-mcp-client` 同为 `0.2.1-rc.2`）。对归档内该模块的只读比对确认：本插件依赖的三条生命周期日志措辞、`Config.reconnect` 字段、导出集合（`Config / apply / createMcpToolDefinition / inject / name`）全部未变，因此适配层沿用同一实现，版本准入改为“已验证版本 + 能力兜底”。离线测试套件的 `devDependencies` 仍固定在 `0.2.0-rc.2`。
 
+> **0.2.2-rc.1 / 插件 0.3.1 复核（2026-11-05）**：工具准入时机已变化：`tools.resolve({ agent, modelSelection, signal })` 先固定本步工具，随后 `systemPrompt.assemble({ ..., toolSet })` 组装提示词。`system-prompt/assemble` 的输入只含文字与变量，不再含 `tools`；按旧结构访问会触发 `Cannot read properties of undefined (reading 'flatMap')`。插件在原生 `resolve()` 前协调自己的 Agent，保留准入条件与执行器投影；新文字回调直接放行，旧宿主继续使用增量刷新。已通过针对性回归和实际 0.2.2-rc.1 服务验证，用户另确认重新启用后运行正常。下文仍保留 0.2.0 的历史调查，涉及请求时机时以本条复核为准。
+
 ## 1. 原生加载链路
 
 | 环节 | 事实 |

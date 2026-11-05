@@ -2,7 +2,13 @@
 
 [English](README.en.md) | 中文
 
-为 **DeepSeek Harness 0.2.1-rc.2**（离线测试基线 `0.2.0-rc.2`）加载项目级 MCP 声明。一个工作区的会话只读取自己的配置，并在各自 Agent 作用域内连接服务器；不会把配置写入 DSH 全局 profile，也不会修改原声明文件。
+为 **DeepSeek Harness 0.2.2-rc.1**（保留 `0.2.0-rc.2` / `0.2.1-rc.2` 兼容路径）加载项目级 MCP 声明。一个工作区的会话只读取自己的配置，并在各自 Agent 作用域内连接服务器；不会把配置写入 DSH 全局 profile，也不会修改原声明文件。
+
+## 0.3.1：DSH 0.2.2 兼容修复
+
+0.2.2 在提示词组装前固定本步可执行工具，`system-prompt/assemble` 回调不再包含 `tools`。本插件在原生 `tools.resolve()` 准入前协调工作区 MCP；只处理自己的 Agent，保留原生条件、执行器投影与取消语义，卸载时恢复适配。新版文字组装回调不再读取或重写工具列表，旧版继续使用增量刷新。仅给缺失字段补空数组会掩盖崩溃，却无法让新工具进入本步的可执行快照。
+
+修复升级 DSH 后会话报 `Cannot read properties of undefined (reading 'flatMap')` 的问题。已通过 12 项针对性回归，以及实际 0.2.2-rc.1 服务的空工作区、声明新增/变更/删除和卸载恢复验证；2026-11-05 用户确认重新启用后运行正常。更新宿主代码后需重新加载插件（无法热重组时重启 DSH）。
 
 ## 内置预设
 
@@ -25,7 +31,7 @@
 
 两个座位的文案都以包名为命名空间注册进 `ctx.locale` 的中英词典，随 GUI 语言切换；没有 locale 服务时使用中文列。
 
-详细契约、安全边界与生效方式见 [管理界面文档](<docs/management-ui.md>)。客户端半是仓库里的构建产物 `lib/client.js`，由 `src/client.js` 经 `pnpm run build` 生成；缺这个文件时宿主会报缺 bundle 并拒绝激活，所以改完客户端源码必须先构建。是否自动热替换取决于宿主的开发构建监听是否运行，页面打开不能说明新 bundle 已生效。**宿主**半改完要重启 Harness 才会重新 import 模块。
+详细契约、安全边界与生效方式见 [管理界面文档](<docs/management-ui.md>)。客户端半是仓库里的构建产物 `lib/client.js`，由 `src/client.js` 经 `pnpm run build` 生成；缺这个文件时宿主会报缺 bundle 并拒绝激活，所以改完客户端源码必须先构建。是否自动热替换取决于宿主的开发构建监听是否运行，页面打开不能说明新 bundle 已生效。**宿主**半改完需触发 profile 热重组以重新 import 模块；未生效或宿主不支持热重组时再重启 Harness。
 
 ## 自动重连（Auto reconnect）
 
@@ -36,7 +42,7 @@
 - **断线感知**：对已连接的 HTTP 服务器做只读可达性探测（`HEAD`，1.5 秒超时，不带凭据，任何 HTTP 响应都算存活）。第一次失败立即撤下绿点、显示「待确认」，1.2 秒后复核；连续两次失败才交给重连监督器，而任何真实调用成功都会刷新确认。节奏随活跃度：有 MCP 活动时 10 秒，2 分钟后 30 秒，5 分钟无活动即停。面板打开时与工具调用前（距上次确认超过 5 秒）会即时探测，不可达时该次调用立刻得到明确原因，而不是干等工具超时；原调用不会重放。`stdio` 依赖子进程退出事件，不做探测。
 - 不重放失败工具、不替 UnityEditor 启动服务器。HTTP 会话 404 经有类型的调用错误识别后，按退避重新初始化会话，而不重放该调用。
 
-更多边界见[管理界面的自动重连说明](<docs/management-ui.md#auto-reconnect>)。本轮验证仅覆盖后端检查与客户端构建，**尚未完成运行中宿主的部署验证**；宿主源码改动必须实际重启 Harness，不能靠切换插件条目或假定 HMR 生效。
+更多边界见[管理界面的自动重连说明](<docs/management-ui.md#auto-reconnect>)。0.3.1 的针对性验证及用户重新启用后的运行确认见上方兼容修复说明；这不代表已对所有自动重连与 GUI 场景完成现场验证。
 
 ## 安装
 
@@ -48,7 +54,7 @@
   # 建议锁到具体 commit：'github:<owner>/dsh-mcp-glue#<sha>'
   ```
   这条路径**不需要任何构建步骤**：`lib/client.js` 已随仓库提交，`prepack` 只在本地打包时跑（DSH 侧执行的是 `pnpm add <spec>`，不跑 pack 生命周期）。仓库里也没有 install 期脚本，因此不会出现「有待批准的依赖构建脚本」。
-- **link 安装（推荐用于持续迭代）**：让 profile 直接链接本工程目录，不必每次重新打包；客户端源码改后先构建并确认宿主加载新 bundle，宿主源码改后必须实际重启 Harness（仅重载插件条目不会重新 import）。
+- **link 安装（推荐用于持续迭代）**：让 profile 直接链接本工程目录，不必每次重新打包；客户端源码改后先构建并确认宿主加载新 bundle，宿主源码改后触发 profile 热重组并确认生效，不支持或未生效时重启 Harness。
   ```powershell
   # 在 profile 目录执行；spec 用 link: 指向本工程
   pnpm add link:<本工程绝对路径>
@@ -57,7 +63,7 @@
 
 本包的**运行时代码刻意不 import** 任何 `@deepseek-ai/dsh-*` 模块：作用域身份来自模块私有 Symbol，第二份模块拷贝会让 scoped 注册退化成全局注册。原生 MCP 桥接通过宿主 Cordis loader 按运行时自己的实例加载（详见[调查笔记](<docs/loading-model.md#6-模块实例身份第三方插件的关键约束>)）。
 
-`peerDependencies` 只声明 `@deepseek-ai/dsh: >=0.2.0-rc.2` 并标为 `optional`。DSH 用它做安装与启动时的版本兼容判定（只认 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` 前缀），不满足就拒绝安装或告警；标 optional 后 pnpm 不会自动安装它，它也不代表运行时 import。`engines.dsh` 只是文档，运行时不读。
+`peerDependencies` 只声明 `@deepseek-ai/dsh: >=0.2.0-rc.2` 并标为 `optional`。DSH 用它做安装与启动时的版本兼容判定（只认 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` 前缀），不满足就拒绝安装或告警；标 optional 后 pnpm 不会自动安装它，它也不代表运行时 import。`engines.dsh` 在 DSH 0.2.1+ 会被真实校验，0.2.0 的兼容判定则由上述 peer 声明覆盖。
 
 开发/打包（`node`/`pnpm` 应为 Node 22.16+）：
 
