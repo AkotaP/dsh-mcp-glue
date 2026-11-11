@@ -114,6 +114,19 @@ export function createWebHandler(control, token, logger) {
         }
         return;
       }
+      if (action === 'probe') {
+        if (req.method !== 'POST') { sendJson(res, 405, { error: 'use POST' }); return; }
+        const body = await readJson(req);
+        const sessionId = sessionOf(body);
+        if (!sessionId) { sendJson(res, 400, { error: 'sessionId is required' }); return; }
+        const serverId = serverOf(body);
+        if (serverId === undefined) { sendJson(res, 400, { error: 'serverId is required' }); return; }
+        // A probe spawns a short-lived child or a throwaway session: it never touches the
+        // live mount, so this is the read-only "test this server" action the panel offers.
+        logger?.info?.('workspace-mcp: probe requested for ' + serverId + ' in session ' + sessionId);
+        sendJson(res, 200, await control.probe(sessionId, serverId));
+        return;
+      }
       if (action === 'declaration') {
         if (req.method !== 'POST') { sendJson(res, 405, { error: 'use POST' }); return; }
         const body = await readJson(req);

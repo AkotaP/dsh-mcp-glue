@@ -2,13 +2,15 @@
 
 [English](README.en.md) | 中文
 
-为 **DeepSeek Harness 0.2.2-rc.1**（保留 `0.2.0-rc.2` / `0.2.1-rc.2` 兼容路径）加载项目级 MCP 声明。一个工作区的会话只读取自己的配置，并在各自 Agent 作用域内连接服务器；不会把配置写入 DSH 全局 profile，也不会修改原声明文件。
+为 **DeepSeek Harness 0.2.2-rc.2**（保留 `0.2.0-rc.2` / `0.2.1-rc.2` 兼容路径）加载项目级 MCP 声明。一个工作区的会话只读取自己的配置，并在各自 Agent 作用域内连接服务器；不会把配置写入 DSH 全局 profile，也不会修改原声明文件。
 
-## 0.3.1：DSH 0.2.2 兼容修复
+## 0.3.2：DSH 0.2.2-rc.2 兼容、原生连接状态与「测试连接」
 
-0.2.2 在提示词组装前固定本步可执行工具，`system-prompt/assemble` 回调不再包含 `tools`。本插件在原生 `tools.resolve()` 准入前协调工作区 MCP；只处理自己的 Agent，保留原生条件、执行器投影与取消语义，卸载时恢复适配。新版文字组装回调不再读取或重写工具列表，旧版继续使用增量刷新。仅给缺失字段补空数组会掩盖崩溃，却无法让新工具进入本步的可执行快照。
-
-修复升级 DSH 后会话报 `Cannot read properties of undefined (reading 'flatMap')` 的问题。已通过 12 项针对性回归，以及实际 0.2.2-rc.1 服务的空工作区、声明新增/变更/删除和卸载恢复验证；2026-11-05 用户确认重新启用后运行正常。更新宿主代码后需重新加载插件（无法热重组时重启 DSH）。
+- 接入 `dsh-mcp-client` 0.2.2+ 的 `connectionStatusOf(fiber)`：断线、重连、失败原因与清理结果直接读原生状态机；旧版本继续用日志文本兜底，无法适配时回退原生行为。
+- 关闭确认改读状态单元的 `closure()`：`closeConfirmed: false` 或 `cleanupError` 一律标记 `CLOSE_UNCONFIRMED`。0.2.2 移除了原先匹配的两句关闭日志（改说 `cleanup incomplete`），旧逻辑在 rc.2 上无法再拦截重叠进程。
+- 面板每行新增「测试连接」：调用原生 `probeServer()` 完成一次真实 MCP 握手与工具列表（stdio 与 HTTP 均可），不注册工具、不占用服务器名、不影响现有连接，返回服务器身份、工具数与耗时。
+- 修复面板定位：弹层 portal 到 `document.body`，不再被输入框工具行的 transform/contain 影响，位置始终跟随 MCP 按钮。
+- 0.3.1 的组装适配（0.2.2 在提示词组装前固定本步可执行工具，`system-prompt/assemble` 不含 `tools`）保持不变。
 
 ## 内置预设
 

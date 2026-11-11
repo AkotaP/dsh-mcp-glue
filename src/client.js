@@ -261,6 +261,13 @@ const DICT = {
   "row.lastVerified": ["上次确认：{seconds} 秒前", "Last confirmed {seconds}s ago"],
   "row.neverVerified": ["尚未确认连接状态", "Not confirmed yet"],
   "row.retryAfter": ["约 {seconds} 秒后重试 · 第 {attempt} 次", "Retry in about {seconds}s · attempt {attempt}"],
+  "action.probe": ["测试连接", "Test connection"],
+  "probe.running": ["测试中…", "Testing…"],
+  "probe.ok": ["连接可用：{name} · {count} 个工具（{ms} ms）", "Reachable: {name} · {count} tools ({ms} ms)"],
+  "probe.okNoName": ["连接可用 · {count} 个工具（{ms} ms）", "Reachable · {count} tools ({ms} ms)"],
+  "probe.okTruncated": ["（工具列表已截断）", " (tool list truncated)"],
+  "probe.failed": ["测试失败（{stage}）：{message}", "Probe failed ({stage}): {message}"],
+  "probe.closeUnconfirmed": ["旧进程未确认关闭，重试前请重启 DSH", "The old process could not be confirmed closed; restart DSH before retrying"],
   "action.retryNow": ["立即重试", "Retry now"],
   "action.stopConnecting": ["停止连接", "Stop connecting"],
   "panel.monitorUnsupported": ["当前原生桥接版本无法验证，增强重连与断线监控不可用。", "This native bridge version cannot be verified; enhanced reconnect and disconnect monitoring are unavailable."],
@@ -746,6 +753,8 @@ function Chip(props) {
   /** The last declaration success or failure, shown in the editor; never the chip's own dot. */
   const [declarationStatus, setDeclarationStatus] = React.useState(undefined);
   const [declarationBusy, setDeclarationBusy] = React.useState(false);
+  /** One-shot probe states keyed by server id: { busy } or { result } or { error }. */
+  const [probes, setProbes] = React.useState({});
   /** Independent manager intent: direct create, inspect, copy or remove. Not a popup sub-page. */
   const [editing, setEditing] = React.useState(undefined);
   /** Server rows whose tool list is unfolded right now, keyed by server id. */
@@ -873,6 +882,18 @@ function Chip(props) {
       window.removeEventListener('keydown', onKey);
     };
   }, [open]);
+
+  /** Run one one-shot probe; the row keeps its connection, this only reports a test result. */
+  const probeServer = async serverId => {
+    if (sessionId === undefined || probes[serverId]?.busy === true) return;
+    setProbes(current => ({ ...current, [serverId]: { busy: true } }));
+    try {
+      const result = await request('/probe', { sessionId, serverId });
+      if (alive.current) setProbes(current => ({ ...current, [serverId]: { result } }));
+    } catch (reason) {
+      if (alive.current) setProbes(current => ({ ...current, [serverId]: { error: reason instanceof Error ? reason.message : String(reason) } }));
+    }
+  };
 
   const act = async (name, serverId) => {
     const sequence = ++actionSequence.current;
@@ -1182,6 +1203,8 @@ function Chip(props) {
     onToggleExpand: serverId => setExpanded(current => ({ ...current, [serverId]: current[serverId] !== true })),
     onAct: action => { void act(action, row.id); },
     showPolicy: false,
+    probe: probes[row.id],
+    onProbe: serverId => { void probeServer(serverId); },
     onEdit: declaration?.targets?.some(target => target.serverId === row.id) ? serverId => openManagement({ mode: 'manage', serverId }) : undefined,
   })));
 
@@ -1260,10 +1283,17 @@ function Chip(props) {
 
   // Exactly one surface is ever on screen: the editor replaces the panel rather than covering it,
   // the way the host's own pickers replace the control that opened them.
-  return React.createElement('span', { className: 'wmcp-wrap' }, [
-    chip,
-    editing !== undefined ? editor : open ? panelSurface : null,
-  ]);
+  //
+  // The panel is positioned against the viewport, so it must not live under the composer row:
+  // a transform/filter/contain on any ancestor would make `position: fixed` resolve against
+  // that ancestor instead, and the measured chip rect would land in the wrong place. The editor
+  // already portals itself; the panel gets the same treatment here.
+  const surface = editing !== undefined
+    ? editor
+    : open
+      ? typeof document === 'undefined' ? panelSurface : createPortal(panelSurface, document.body)
+      : null;
+  return React.createElement('span', { className: 'wmcp-wrap' }, [chip, surface]);
 }
 
 /**
@@ -1366,8 +1396,33 @@ function RetryCountdown({ nextRetryAt, attempt }) {
     t('row.retryAfter', { seconds: Math.max(0, Math.ceil((nextRetryAt - now) / 1000)), attempt }));
 }
 
+/**
+ * One line describing a one-shot probe outcome.
+ *
+ * The Host already redacts resolved credentials when template expansion is on; this keeps the
+ * line short and never renders a whole upstream error body in a row.
+ */
+function probeText(probe) {
+  if (probe.busy === true) return t('probe.running');
+  if (probe.error !== undefined) return t('probe.failed', { stage: 'request', message: String(probe.error) });
+  const result = probe.result ?? {};
+  if (result.ok === true) {
+    const info = result.serverInfo;
+    const identity = info === undefined ? '' : `${info.name} ${info.version}`.trim();
+    const count = result.toolNames?.length ?? 0;
+    const ms = Number.isFinite(result.durationMs) ? result.durationMs : 0;
+    const base = identity === ''
+      ? t('probe.okNoName', { count, ms })
+      : t('probe.ok', { name: identity, count, ms });
+    return `${base}${result.truncated === true ? t('probe.okTruncated') : ''}`;
+  }
+  const stage = result.stage ?? 'connect';
+  const message = String(result.message ?? '').slice(0, 200);
+  return t('probe.failed', { stage, message });
+}
+
 function ServerRow(props) {
-  const { row, allowance, expanded, busy, trusted, writable, onToggleAllow, onToggleTool, onToggleExpand, onAct, onEdit, showPolicy = true } = props;
+  const { row, allowance, expanded, busy, trusted, writable, onToggleAllow, onToggleTool, onToggleExpand, onAct, onEdit, showPolicy = true, probe, onProbe } = props;
   const tools = toolNames(row);
   const allowed = (allowance?.allowMcp ?? []).includes(row.id);
   const connected = row.state === 'connected';
@@ -1411,6 +1466,13 @@ function ServerRow(props) {
       React.createElement('span', { key: 'label' }, t('row.toolsCount', { count: tools.length })),
       React.createElement('span', { key: 'arrow', className: 'wmcp-tools-arrow', 'aria-hidden': true }, expanded ? '▴' : '▾'),
     ]),
+    onProbe === undefined ? null : actionButton({
+      key: 'probe',
+      disabled: busy !== undefined || probe?.busy === true || row.state === 'invalid',
+      title: t('action.probe'),
+      'aria-label': t('action.probe'),
+      onClick: () => onProbe(row.id),
+    }, probe?.busy === true ? t('probe.running') : t('action.probe')),
     actionButton({
       key: 'act',
       disabled: (!canStop && busy !== undefined) || row.state === 'invalid' || row.error === 'CLOSE_UNCONFIRMED',
@@ -1441,6 +1503,9 @@ function ServerRow(props) {
   if (row.error !== undefined) {
     const translated = ['CLOSE_UNCONFIRMED', 'AUTH_REQUIRED', 'DECLARATION_CHANGED', 'ENOENT', 'EACCES', 'EPERM', 'AUTO_CONNECT_REVOKED', 'STARTUP_TIMEOUT'].includes(row.error);
     children.push(React.createElement('span', { key: 'reason', className: 'wmcp-tools-hint' }, translated ? t(`reason.${row.error}`) : row.error));
+  }
+  if (probe !== undefined && (probe.result !== undefined || probe.error !== undefined || probe.busy === true)) {
+    children.push(React.createElement('span', { key: 'probe', className: 'wmcp-tools-hint', 'data-kind': probe.error !== undefined || probe.result?.ok === false ? 'error' : undefined }, probeText(probe)));
   }
   if (expanded) {
     children.push(React.createElement('div', { key: 'tools', className: 'wmcp-tools' },

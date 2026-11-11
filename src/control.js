@@ -40,6 +40,11 @@ export function createControl(ctx, stateFor) {
     async follow(id) {
       return resolve(id).follow(undefined);
     },
+    /** One-shot test of one declared server; the live mount and its selection are untouched. */
+    async probe(id, serverId) {
+      if (typeof serverId !== 'string' || !serverId) throw new Error('workspace-mcp: a server id is required');
+      return resolve(id).probe(serverId);
+    },
     /** The declaration files behind one session, plus whether that session may write them. */
     async declarations(id) {
       return resolve(id).declarationTargets(undefined);

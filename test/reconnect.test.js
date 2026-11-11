@@ -63,17 +63,31 @@ function nextDelay(fixture) {
 }
 
 function fakeBridge() {
-  const attempts = [], modes = new Map();
+  const attempts = [], modes = new Map(), cells = new WeakMap();
   const mode = name => {
     if (!modes.has(name)) modes.set(name, {});
     return modes.get(name);
   };
   const plugin = {
     name: 'mcp-client', inject: ['tools'],
+    connectionStatusOf(fiber) { return cells.get(fiber.ctx.fiber); },
     async apply(child, config) {
       const behavior = mode(config.serverName);
       const attempt = { child, config, disposed: 0, requestError: undefined };
       attempts.push(attempt);
+      if (behavior.status === true) {
+        const listeners = new Set();
+        const cell = {
+          value: { state: 'connected', toolCount: 1, connectedAt: 1 },
+          current() { return cell.value; },
+          closure() { return behavior.closure ?? { closeConfirmed: true }; },
+          onChange(callback) { listeners.add(callback); return () => listeners.delete(callback); },
+          publish(next) { cell.value = next; for (const callback of [...listeners]) callback(next); },
+        };
+        behavior.cell = cell;
+        cells.set(child.fiber, cell);
+        child.effect(() => () => listeners.clear());
+      }
       const gate = behavior.gate;
       child.effect(() => () => {
         attempt.disposed++;
@@ -95,7 +109,9 @@ function fakeBridge() {
       });
     },
   };
-  return { plugin, attempts, mode, release: () => { for (const behavior of modes.values()) behavior.gate?.resolve(); }, for: name => attempts.filter(attempt => attempt.config.serverName === name) };
+  return { plugin, attempts, mode, cell: name => modes.get(name)?.cell,
+    release: () => { for (const behavior of modes.values()) behavior.gate?.resolve(); },
+    for: name => attempts.filter(attempt => attempt.config.serverName === name) };
 }
 
 async function fixture(t, { names = ['same'], required = [], config = {}, random = 1 } = {}) {
@@ -577,3 +593,34 @@ test('startup timeout disposes initialize, replaces its deadline with one retry,
   assert.equal(f.bridge.attempts.length, 2);
   assert.equal(f.clock.pending.length, 0);
 });
+
+test('the native status cell turns a post-connect failure into one retryable outage', async t => {
+  const f = await fixture(t);
+  f.bridge.mode('same').status = true;
+  await f.state.reconcile(signal());
+  assert.equal(view(f).state, 'connected');
+  const cell = f.bridge.cell('same');
+  assert.ok(cell, 'the fixture published a status cell');
+  // The native supervisor reports the lost connection; the workspace runtime owns the retry.
+  cell.publish({ state: 'failed', reason: 'reconnect-disabled' });
+  await drain(f.state);
+  assert.equal(view(f).state, 'reconnecting');
+  assert.deepEqual(view(f).reconnect.attempt, 1);
+  assert.equal(f.bridge.attempts[0].disposed, 1, 'the dead generation was closed before retrying');
+  assert.equal(nextDelay(f), 1000);
+});
+
+test('an unclosed native generation blocks the retry instead of overlapping the old process', async t => {
+  const f = await fixture(t);
+  f.bridge.mode('same').status = true;
+  await f.state.reconcile(signal());
+  f.bridge.cell('same').publish({ state: 'failed', reason: 'unclosed-generation' });
+  await drain(f.state);
+  assert.equal(view(f).state, 'failed');
+  assert.equal(view(f).error, 'CLOSE_UNCONFIRMED');
+  assert.equal(f.clock.pending.length, 0, 'a blocked server schedules no retry');
+  // A manual retry is refused as well: the old transport may still hold the name.
+  await f.state.connect(signal(), 'same');
+  assert.equal(f.bridge.attempts.length, 1, 'no second process was spawned');
+});
+

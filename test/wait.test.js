@@ -68,3 +68,26 @@ test('the control facade waits on one session and reports an unready one', async
   assert.deepEqual(await held, { version: state.statusVersion });
   await assert.rejects(control.wait('missing-session', 0), failure => failure.code === 'SESSION_NOT_READY');
 });
+
+test('the control facade forwards a one-shot probe and refuses an undeclared server', async t => {
+  const { ctx, value, state } = await waiting(t);
+  const calls = [];
+  state.plan = { cwd: process.cwd(), fingerprint: 'probe-plan', diagnostics: [], servers: [
+    { source: { preset: 'fixture', file: '.mcp.json', server: 'demo' },
+      spec: { required: false, config: { serverName: 'demo', transport: 'streamable-http', url: 'http://fixture.invalid/mcp' } } },
+  ] };
+  state.nativePlugin = { ...state.nativePlugin,
+    async probeServer(ownerCtx, config, options) {
+      calls.push({ ownerCtx, config, options });
+      return { ok: true, toolNames: ['identity'], truncated: false, durationMs: 5, closeConfirmed: true };
+    } };
+  const control = createControl(ctx, candidate => (candidate === value ? state : undefined));
+  const result = await control.probe('wait-agent', 'demo');
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].config.serverName, 'demo');
+  assert.equal(calls[0].options.timeoutMs, 10000);
+  await assert.rejects(control.probe('wait-agent', 'missing'), failure => failure.code === 'UNKNOWN_SERVER');
+  await assert.rejects(control.probe('wait-agent', undefined), /server id/);
+});
+

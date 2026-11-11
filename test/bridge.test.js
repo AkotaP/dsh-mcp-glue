@@ -320,3 +320,53 @@ test('real native initial auth failure propagates through fiber.await, not a dis
   assert.ok(!JSON.stringify(records).includes('DO_NOT_LOG'));
   await dispose(fiber);
 });
+
+test('a native status cell is observed: the adapter forwards transitions without touching the cell', async t => {
+  const ctx = await harness(t), events = [];
+  const cells = new WeakMap();
+  const native = {
+    name: 'mcp-client', inject: ['tools'],
+    async apply(child) {
+      const listeners = new Set();
+      const cell = {
+        value: { state: 'connected', toolCount: 2, connectedAt: 10 },
+        current() { return cell.value; },
+        closure() { return { closeConfirmed: true }; },
+        onChange(callback) { listeners.add(callback); return () => listeners.delete(callback); },
+        publish(next) { cell.value = next; for (const callback of [...listeners]) callback(next); },
+        listeners,
+      };
+      cells.set(child.fiber, cell);
+      child.effect(() => () => listeners.clear());
+    },
+    connectionStatusOf(fiber) { return cells.get(fiber.ctx.fiber); },
+  };
+  const fiber = ctx.plugin(createNativeAdapter(native, { logger: ctx.logger, serverName: 'status', onEvent: event => events.push(event) }), {});
+  await fiber;
+  // The current value is published once on subscribe, so the runtime learns the live state
+  // even when it attaches after the native apply already finished.
+  assert.deepEqual(events, [{ kind: 'status', status: { state: 'connected', toolCount: 2, connectedAt: 10 } }]);
+  cells.get(fiber.ctx.fiber).publish({ state: 'failed', reason: 'reconnect-disabled' });
+  assert.deepEqual(events.at(-1), { kind: 'status', status: { state: 'failed', reason: 'reconnect-disabled' } });
+  await dispose(fiber);
+  assert.equal(cells.get(fiber.ctx.fiber).listeners.size, 0, 'the subscription is released with the fiber');
+});
+
+test('0.2.2 lifecycle wording is classified without matching a first failed attempt', async t => {
+  const ctx = await harness(t), { logger, records } = sink(), events = [];
+  const label = 'mcp-client(cleanup)';
+  const native = { name: 'mcp-client', inject: ['tools'], async apply(child) {
+    // 0.2.2 reports an initial connect failure with this new sentence; it must not look like a
+    // disconnect because the rejected apply already carries that failure.
+    child.logger.error(`${label}: connection failed and reconnect is disabled — no tools were registered; reload the plugin or restart the Host to connect`);
+    // …while closure problems collapsed into this line instead of the two older sentences.
+    child.logger.error(`${label}: cleanup incomplete`);
+  } };
+  const fiber = ctx.plugin(createNativeAdapter(native, { logger, serverName: 'cleanup', onEvent: event => events.push(event) }), {});
+  await fiber;
+  assert.deepEqual(events, [{ kind: 'unsafe-close', code: 'CLOSE_UNCONFIRMED' }]);
+  assert.ok(records.every(record => record.args.length === 1));
+  assert.ok(!JSON.stringify(events).includes('cleanup'));
+  await dispose(fiber);
+});
+

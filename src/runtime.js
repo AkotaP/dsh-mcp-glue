@@ -604,6 +604,19 @@ export class WorkspaceMcpSession {
   current(record, token = record.token) {
     return !this.closed && !record.stopped && this.mounts.get(record.name) === record && record.token === token;
   }
+  /**
+   * The native status handle for one mounted fiber, on releases that publish one (0.2.2+).
+   *
+   * Reading it must never make a connection fail: a missing or throwing accessor degrades to
+   * the log-text path the adapter keeps as a fallback.
+   */
+  nativeStatus(fiber) {
+    try {
+      const read = this.nativePlugin?.connectionStatusOf;
+      return typeof read === 'function' && fiber !== undefined
+        ? read.call(this.nativePlugin, fiber) : undefined;
+    } catch { return undefined; }
+  }
   viewRecord(record, state, error, nextRetryAt = null) {
     this.serverStates.set(record.name, {
       state, tools: state === SERVER_STATES.connected ? this.toolNamesFor(record.name) : [], error,
@@ -745,7 +758,15 @@ export class WorkspaceMcpSession {
     if (record.closingBoundary === boundary && record.closing) { await record.closing; return; }
     record.closingBoundary = boundary;
     record.closingToken = token;
-    const closing = Promise.resolve().then(() => boundary.dispose()).catch(() => {
+    const closing = Promise.resolve().then(() => boundary.dispose()).then(() => {
+      // 0.2.2+ records the transport and local cleanup outcome on the status cell instead of
+      // logging it. A disposal that "succeeded" can still leave the child process alive, so an
+      // unconfirmed closure or a cleanup error must block any respawn under this name.
+      const result = this.nativeStatus(record.fiber)?.closure?.();
+      if (result !== undefined && (result.closeConfirmed === false || typeof result.cleanupError === 'string')) {
+        throw Object.assign(new Error('workspace-mcp: native transport closure unconfirmed'), { code: 'CLOSE_UNCONFIRMED' });
+      }
+    }).catch(() => {
       this.unsafeNames.add(record.name);
       this.logger.warn(`workspace-mcp: ${record.name} CLOSE_UNCONFIRMED (details redacted)`);
     });
@@ -782,6 +803,25 @@ export class WorkspaceMcpSession {
       record.confirmed = true;
       this.lastActivityAt = record.lastVerifiedAt;
       this.publish();
+      return;
+    }
+    if (event.kind === 'status') {
+      // 0.2.2+ state machine. Only the post-connect failure is news here: an initial failure
+      // already rejects the native apply and reaches startRecord's catch, and every other
+      // transition is either mirrored by the mount result or means "disposing".
+      const status = event.status;
+      if (status?.state !== 'failed' || record.down || record.connectedAt === undefined) return;
+      // An unclosed generation blocks replacement outright: respawning could overlap the old
+      // server process, so mark the name unsafe and stop retrying it.
+      if (status.reason === 'unclosed-generation') {
+        this.unsafeNames.add(record.name);
+        record.error = 'CLOSE_UNCONFIRMED'; record.retryable = false;
+        this.viewRecord(record, SERVER_STATES.failed, record.error);
+        return;
+      }
+      if (!this.current(record, token)) return;
+      void this.enqueue(() => this.current(record, token) && !record.down
+        ? this.failed(record, { code: 'CONNECTION_LOST', retryable: true }) : undefined).catch(() => {});
       return;
     }
     if (event.kind === 'unsafe-close' && (this.current(record, token) || record.closingToken === token)) this.unsafeNames.add(record.name);
@@ -988,6 +1028,7 @@ export class WorkspaceMcpSession {
       }) : this.nativePlugin;
       const config = this.monitoring ? { ...spec.config, failOnStartupError: true, reconnect: { enabled: false } } : spec.config;
       const fiber = server.ctx.plugin(plugin, config);
+      record.fiber = fiber;
       const cancelled = new Promise((_, reject) => {
         cancel = () => reject(signal.reason ?? new Error('cancelled'));
         signal.addEventListener('abort', cancel, { once: true });
@@ -995,7 +1036,10 @@ export class WorkspaceMcpSession {
         timer = this.clock.setTimeout(() => reject(Object.assign(new Error('startup timeout'), { code: 'STARTUP_TIMEOUT' })), timeoutMs);
       });
       await Promise.race([fiber.await(), cancelled]);
+      // The cell is registered by the native apply; keep the handle for post-mortem closure checks.
+      record.status = this.nativeStatus(fiber);
     } catch (error) {
+      record.status = this.nativeStatus(record.fiber) ?? record.status;
       record.boundary = undefined;
       await this.closeBoundary(record, server, token);
       if (this.mounts.get(name) === record && record.token === token) this.toolFilters.delete(name);
@@ -1011,6 +1055,23 @@ export class WorkspaceMcpSession {
     await Promise.all([...this.mounts.values()].map(record => this.retire(record)));
     this.toolFilters.clear(); this.serverStates.clear(); this.requiredFailure = false;
     if (group) await group.dispose();
+  }
+  /**
+   * Test one declared server without touching its live mount.
+   *
+   * Uses the loaded bridge's own one-shot probe (0.2.2+) so the answer reflects a real MCP
+   * handshake and tool listing instead of the reachability guess the heartbeat makes. Nothing
+   * registers and no name is reserved, so a probe works for a connected, stopped or failed row.
+   * @param serverId - the normalized server name the panel shows.
+   * @returns the bridge's probe outcome (connect/list result plus cleanup confirmation).
+   */
+  async probe(serverId) {
+    const entry = (this.plan?.servers ?? []).find(item => item.spec.config.serverName === serverId);
+    if (entry === undefined) throw Object.assign(new Error('workspace-mcp: no such declared server'), { code: 'UNKNOWN_SERVER' });
+    const probe = this.nativePlugin?.probeServer;
+    if (typeof probe !== 'function') throw Object.assign(new Error('workspace-mcp: the loaded MCP bridge cannot probe servers'), { code: 'PROBE_UNSUPPORTED' });
+    this.noteActivity();
+    return probe.call(this.nativePlugin, this.scopeOwner, entry.spec.config, { timeoutMs: this.config.probeTimeoutMs ?? 10000 });
   }
   /** Model-facing tool names this server currently publishes in the Agent scope. */
   toolNamesFor(serverName) {

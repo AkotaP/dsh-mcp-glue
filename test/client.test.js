@@ -800,8 +800,12 @@ test('the declaration editor is a sibling surface, never nested inside the panel
   assert.match(CSS, /\.wmcp-dialog input:disabled/, 'a read-only entry still shows its fields as locked');
   // And only one of the two surfaces renders at a time, so they can never overlap.
   const source = await fs.readFile(new URL('../src/client.js', import.meta.url), 'utf8');
-  assert.match(source, /editing !== undefined \? editor : open \? panelSurface : null/, 'the manager remains independent after closing the small popover');
+  assert.match(source, /const surface = editing !== undefined/, 'the manager remains independent after closing the small popover');
   assert.match(source, /createPortal\(modal, document.body\)/, 'the modal escapes composer clipping and stacking contexts');
+  // The small panel uses the same escape hatch: a transformed composer ancestor would otherwise
+  // make `position: fixed` resolve against it and the measured chip rect would place the panel
+  // somewhere else entirely.
+  assert.match(source, /createPortal\(panelSurface, document.body\)/, 'the panel escapes composer clipping and stacking contexts too');
   // The Host separates a clash in another declaration file (DECLARATION_CONFLICT, which overwriting
   // cannot fix) from a name the target file already holds (DECLARATION_EXISTS, which it does), so
   // only the second one may open the overwrite prompt.

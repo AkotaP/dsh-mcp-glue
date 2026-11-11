@@ -2,13 +2,15 @@
 
 [中文](README.md) | English
 
-Loads project-level MCP declarations for **DeepSeek Harness 0.2.2-rc.1** (retaining compatibility paths for `0.2.0-rc.2` / `0.2.1-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
+Loads project-level MCP declarations for **DeepSeek Harness 0.2.2-rc.2** (retaining compatibility paths for `0.2.0-rc.2` / `0.2.1-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
 
-## 0.3.1: DSH 0.2.2 compatibility fix
+## 0.3.2: DSH 0.2.2-rc.2 compatibility, native connection status, and probe
 
-0.2.2 fixes executable tools before prompt assembly; the `system-prompt/assemble` waterfall no longer contains `tools`. This plugin reconciles workspace MCP before native `tools.resolve()` admission, only for its own Agents, retaining native conditions, executor projection and cancellation. The adapter is restored on unload. The new text waterfall never reads or rewrites tools; older Hosts retain delta refresh. Defaulting the missing field to an empty array would hide the crash but would not admit new tools into the current executable snapshot.
-
-Fixes sessions failing with `Cannot read properties of undefined (reading 'flatMap')` after upgrading DSH. Verified with 12 targeted regressions and the actual 0.2.2-rc.1 services (empty workspace, same-step declaration add/change/remove, and unload restoration). On 2026-11-05 the user confirmed normal operation after re-enabling the plugin. Reload the plugin after updating host code, or restart DSH if hot recomposition is unavailable.
+- Observes `connectionStatusOf(fiber)` from `dsh-mcp-client` 0.2.2+: disconnect, reconnect, failure reason and cleanup result come from the native state machine. Older releases keep the log-text fallback, and an unadaptable bridge falls back to native behaviour.
+- Closure confirmation now reads the status cell's `closure()`: `closeConfirmed: false` or a `cleanupError` marks `CLOSE_UNCONFIRMED`. 0.2.2 replaced the two sentences the text path used with `cleanup incomplete`, so the old logic could no longer block an overlapping process on rc.2.
+- Every panel row offers "Test connection": the native `probeServer()` performs a real MCP handshake and tool listing (stdio and HTTP), registering no tools, reserving no name, and leaving the live connection untouched; it reports server identity, tool count and duration.
+- Fixes panel placement: the popover now portals to `document.body`, so a transform/contain on the composer row cannot displace it; it follows the MCP chip.
+- The 0.3.1 assembly adaptation (0.2.2 freezes executable tools before prompt assembly; the `system-prompt/assemble` waterfall no longer has `tools`) is unchanged.
 
 ## Built-in presets
 

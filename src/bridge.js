@@ -133,21 +133,35 @@ export function createNativeAdapter(nativePlugin, { onEvent, logger, serverName 
       const name = serverName ?? config.serverName;
       const sink = logger ?? ctx.logger;
       const label = `mcp-client(${name})`;
-      const lost = `${label}: connection lost and reconnect is disabled — registered tools will fail until an HMR reload or Host restart`;
-      const failedClose = `${label}: failed generation could not confirm transport closure — reconnect stopped to avoid overlapping server processes; reload the plugin or restart the Host to retry`;
-      const disposalClose = `${label}: transport closure could not be confirmed during disposal — server shutdown may be incomplete`;
+      /**
+       * Lifecycle wording by release:
+       * - 0.2.0/0.2.1: "connection lost …" and the two "… could not confirm transport closure" lines.
+       * - 0.2.2+: the loss line survives, closure problems collapse into "cleanup incomplete".
+       * Prefix matching keeps the text path working across those releases; 0.2.2+ additionally
+       * publishes a status cell that the adapter subscribes to below.
+       */
+      const lifecycle = new Map([
+        ['connection lost and reconnect is disabled', { kind: 'disconnected', code: 'CONNECTION_LOST' }],
+        ['failed generation could not confirm transport closure', { kind: 'unsafe-close', code: 'CLOSE_UNCONFIRMED' }],
+        ['transport closure could not be confirmed during disposal', { kind: 'unsafe-close', code: 'CLOSE_UNCONFIRMED' }],
+        ['cleanup incomplete', { kind: 'unsafe-close', code: 'CLOSE_UNCONFIRMED' }],
+      ]);
+      const lifecycleOf = text => {
+        if (typeof text !== 'string' || !text.startsWith(`${label}: `)) return undefined;
+        const message = text.slice(label.length + 2);
+        for (const [prefix, event] of lifecycle) if (message.startsWith(prefix)) return event;
+        return undefined;
+      };
       function emit(event) {
         // An observer must never replace the original exception or break native disposal.
         try { Promise.resolve(onEvent?.(event)).catch(() => {}); } catch {}
       }
       const safeLogger = Object.assign(() => safeLogger, Object.fromEntries(
         ['warn', 'error', 'info', 'debug'].map(level => [level, (...args) => {
-          // Only the verified native error-level, single-string records carry lifecycle signals.
+          // Only error-level, single-string records carry lifecycle signals.
           if (level === 'error' && args.length === 1) {
-            if (args[0] === lost) emit({ kind: 'disconnected', code: 'CONNECTION_LOST' });
-            if (args[0] === failedClose || args[0] === disposalClose) {
-              emit({ kind: 'unsafe-close', code: 'CLOSE_UNCONFIRMED' });
-            }
+            const event = lifecycleOf(args[0]);
+            if (event !== undefined) emit(event);
           }
           sink[level](`workspace-mcp: native ${level} (${name}; details redacted)`);
         }]),
@@ -199,7 +213,21 @@ export function createNativeAdapter(nativePlugin, { onEvent, logger, serverName 
           return registrationProxy(this.get('mcpResources'), ([server, provider, ...rest]) => [server, observe(provider, 'request'), ...rest]);
         },
       });
-      return await Reflect.apply(nativePlugin.apply, nativePlugin, [overlay, config]);
+      const applied = await Reflect.apply(nativePlugin.apply, nativePlugin, [overlay, config]);
+      // 0.2.2+ publishes a per-instance status cell keyed by the owning Fiber, exactly what an
+      // embedding manager is supposed to observe. Subscribe after apply so the cell exists, and
+      // keep the text path above only as the fallback for releases without this surface.
+      if (typeof nativePlugin.connectionStatusOf === 'function') {
+        try {
+          const status = nativePlugin.connectionStatusOf(ctx.fiber);
+          if (status !== undefined && typeof status.onChange === 'function') {
+            const off = status.onChange(next => emit({ kind: 'status', status: next }));
+            ctx.effect(() => off);
+            emit({ kind: 'status', status: status.current() });
+          }
+        } catch { /* an unreadable status must never break the connection */ }
+      }
+      return applied;
     },
   };
 }
