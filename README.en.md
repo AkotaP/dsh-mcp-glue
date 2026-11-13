@@ -4,6 +4,13 @@
 
 Loads project-level MCP declarations for **DeepSeek Harness 0.2.2-rc.2** (retaining compatibility paths for `0.2.0-rc.2` / `0.2.1-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
 
+## 0.3.3: panel detail fixes
+
+- The panel no longer appears at a fallback offset and then jumps: the MCP chip is measured in a layout effect before paint, and the panel stays hidden until that measurement exists.
+- A row is always one line: the retry countdown lives in the state tag (`Reconnecting · 12s`, tabular digits), with the attempt count and transport code in that tag's tooltip; Retry is back on the row and the primary control reads Stop / Retry (full labels stay in `title` and `aria-label`). A bare transport code no longer earns a line of its own — only actionable failures do.
+- Horizontal overflow fixed: `overflow-x` is hidden and rows may shrink, so the panel never grows a horizontal scrollbar and no control is pushed past its edge.
+- Removed the redundant row `⋯`: clicking a server name already opens the editor, and a duplicate entry only consumed width and caused that overflow.
+
 ## 0.3.2: DSH 0.2.2-rc.2 compatibility, native connection status, and probe
 
 - Observes `connectionStatusOf(fiber)` from `dsh-mcp-client` 0.2.2+: disconnect, reconnect, failure reason and cleanup result come from the native state machine. **Once that subscription succeeds, lifecycle log text is not consulted at all** — one source of truth, so wording drift cannot produce duplicate events. Only releases without that surface use the log-text fallback, and an unadaptable bridge falls back to native behaviour.
