@@ -1362,18 +1362,19 @@ test('a copy that clears a prefilled box asks for that key to be deleted, and an
   ], 'the request carries the typed address, the chosen transport and the deletion of the emptied path');
 });
 
-test('reconnecting rows are amber, show a local countdown, and offer stop and immediate retry', async () => {
+test('reconnecting rows keep one line: a live countdown tag plus stop and retry', async () => {
   const { exports } = await loadClientBundle();
   const { ServerRow, chipSummary, statusSignature } = exports.__internals;
   const row = { id: 'wire', state: 'reconnecting', tools: [], error: 'CONNECTION_LOST', reconnect: { eligible: true, attempt: 3, nextRetryAt: Date.now() + 60000 } };
   const status = { servers: [row], counts: { declarations: 1, connected: 0 } };
   assert.equal(chipSummary(status).state, 'unauthorized', 'recovery uses the warning colour, not failure red');
   const rendered = renderToStaticMarkup(React.createElement(ServerRow, { row, busy: 'connect:wire', expanded: false, showPolicy: false, onAct: noop, onToggleExpand: noop }));
-  assert.match(rendered, /重连中/);
-  assert.match(rendered, /秒后重试/);
-  assert.match(rendered, /停止连接/);
-  assert.match(rendered, /立即重试/);
-  const stop = rendered.slice(rendered.lastIndexOf('<button', rendered.indexOf('停止连接')), rendered.indexOf('停止连接'));
+  assert.match(rendered, /重连中 · \d+s/, 'the countdown lives in the tag, not on a second line');
+  assert.match(rendered, /秒后重试 · 第 3 次/, 'attempt and reason stay in the tag tooltip');
+  assert.match(rendered, />停止</);
+  assert.match(rendered, />重试</);
+  assert.doesNotMatch(rendered, /wmcp-row-actions/, 'no secondary action line');
+  const stop = rendered.slice(rendered.lastIndexOf('<button', rendered.indexOf('>停止<')), rendered.indexOf('>停止<'));
   assert.doesNotMatch(stop, /disabled/, 'stop remains available while the initiating connect awaits startup');
   assert.notEqual(statusSignature(status), statusSignature({ ...status, servers: [{ ...row, reconnect: { ...row.reconnect, nextRetryAt: row.reconnect.nextRetryAt + 1 } }] }));
   assert.notEqual(statusSignature(status), statusSignature({ ...status, servers: [{ ...row, error: 'AUTH_REQUIRED' }] }));
@@ -1390,11 +1391,10 @@ test('a troubled row keeps every action inside the panel width', async () => {
     row, busy: undefined, expanded: false, showPolicy: false,
     onAct: noop, onToggleExpand: noop, onEdit: noop, probe: {}, onProbe: noop,
   }));
-  const primary = markup.slice(0, markup.indexOf('wmcp-row-actions'));
-  assert.ok(primary.includes('停止连接'));
-  assert.ok(!primary.includes('立即重试'), 'retry now moved off the primary row');
-  assert.ok(!primary.includes('⋯'), 'the server name is the only entry into the editor');
-  assert.match(markup, /wmcp-row-actions/);
+  assert.match(markup, />停止</);
+  assert.match(markup, />重试</, 'retry is back on the row itself');
+  assert.doesNotMatch(markup, /⋯/, 'the server name is the only entry into the editor');
+  assert.equal((markup.match(/wmcp-row/g) ?? []).length, 1, 'the row stays a single line');
   assert.match(CSS, /\.wmcp-panel\{[^}]*overflow-x:hidden/, 'the panel never grows a horizontal scrollbar');
   assert.match(CSS, /\.wmcp-row\{[^}]*min-width:0/);
 });
