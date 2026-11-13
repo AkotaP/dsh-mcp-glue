@@ -262,6 +262,7 @@ const DICT = {
   "row.neverVerified": ["尚未确认连接状态", "Not confirmed yet"],
   "row.retryAfter": ["约 {seconds} 秒后重试 · 第 {attempt} 次", "Retry in about {seconds}s · attempt {attempt}"],
   "action.probe": ["测试连接", "Test connection"],
+  "action.probeShort": ["测试", "Test"],
   "probe.running": ["测试中…", "Testing…"],
   "probe.ok": ["连接可用：{name} · {count} 个工具（{ms} ms）", "Reachable: {name} · {count} tools ({ms} ms)"],
   "probe.okNoName": ["连接可用 · {count} 个工具（{ms} ms）", "Reachable · {count} tools ({ms} ms)"],
@@ -371,7 +372,7 @@ const CSS = `
 .wmcp-act[data-variant=primary]:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}
 .wmcp-count{font-variant-numeric:tabular-nums}
 /* The host's menu material: its fill plus backdrop filter, over the page. */
-.wmcp-panel{position:fixed;z-index:60;width:360px;max-width:calc(100vw - 24px);max-height:min(60vh,420px);overflow:auto;padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-lg);background:var(--dsw-menu-surface-fill,var(--dsw-alias-bg-overlay));backdrop-filter:var(--dsw-menu-backdrop-filter);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px}
+.wmcp-panel{position:fixed;z-index:60;width:360px;max-width:calc(100vw - 24px);max-height:min(60vh,420px);overflow-y:auto;overflow-x:hidden;padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-lg);background:var(--dsw-menu-surface-fill,var(--dsw-alias-bg-overlay));backdrop-filter:var(--dsw-menu-backdrop-filter);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px}
 .wmcp-head{display:flex;align-items:baseline;gap:6px;margin:0 0 8px}
 .wmcp-head strong{font-size:13px;font-weight:600;flex:none}
 .wmcp-path{color:var(--dsw-alias-label-tertiary);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
@@ -380,7 +381,8 @@ const CSS = `
 /* One declared server is one item: its row, plus the tool list it can unfold below. */
 .wmcp-item{display:flex;flex-direction:column;border-top:1px solid var(--dsw-alias-border-l2)}
 .wmcp-item:first-of-type{border-top:0}
-.wmcp-row{display:flex;align-items:center;gap:8px;padding:6px 2px}
+.wmcp-row{display:flex;align-items:center;gap:8px;padding:6px 2px;min-width:0}
+.wmcp-row-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 2px 4px;min-width:0}
 .wmcp-more{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;height:22px;padding:0 5px;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:10px;line-height:14px;cursor:pointer}
 .wmcp-more:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .wmcp-more[aria-expanded=true]{color:var(--dsw-alias-label-primary)}
@@ -848,7 +850,10 @@ function Chip(props) {
     return () => { stopped = true; clearTimeout(timer); controller?.abort(); };
   }, [open, warm, load]);
 
-  React.useEffect(() => {
+  // Placement must happen before the first paint. With `useEffect` the panel was painted once
+  // at its fallback offset and then jumped to the measured spot, which is exactly the flash
+  // this layout effect removes.
+  React.useLayoutEffect(() => {
     if (!open) return undefined;
     const place = () => {
       const node = anchor.current;
@@ -1264,7 +1269,11 @@ function Chip(props) {
     className: 'wmcp-panel',
     role: 'dialog',
     'aria-label': t('panel.managerTitle'),
-    style: rect === undefined ? { left: 12, bottom: 64 } : { left: rect.left, bottom: rect.bottom },
+    style: rect === undefined
+      // Before the layout effect measures the chip, paint nothing rather than the fallback
+      // offset: a wrong first paint is the flash this avoids.
+      ? { left: 12, bottom: 64, visibility: 'hidden' }
+      : { left: rect.left, bottom: rect.bottom },
   }, [
     React.createElement('div', { key: 'head', className: 'wmcp-head' }, [
       React.createElement('strong', { key: 'title' }, t('common.workspaceMcp')),
@@ -1472,26 +1481,32 @@ function ServerRow(props) {
       title: t('action.probe'),
       'aria-label': t('action.probe'),
       onClick: () => onProbe(row.id),
-    }, probe?.busy === true ? t('probe.running') : t('action.probe')),
+    }, probe?.busy === true ? t('probe.running') : t('action.probeShort')),
     actionButton({
       key: 'act',
       disabled: (!canStop && busy !== undefined) || row.state === 'invalid' || row.error === 'CLOSE_UNCONFIRMED',
       title: row.state === 'invalid' ? t('row.unconvertible') : undefined,
       onClick: () => onAct(connected || connecting ? 'disconnect' : 'connect'),
     }, busy !== undefined && !canStop ? '…' : connected ? t('action.disconnect') : connecting ? t('action.stopConnecting') : row.state === 'failed' ? t('action.retryNow') : t('action.connect')),
-    connecting ? actionButton({
-      key: 'retry', disabled: busy !== undefined || row.error === 'CLOSE_UNCONFIRMED',
-      onClick: () => onAct('connect'),
-    }, t('action.retryNow')) : null,
     onEdit === undefined ? null : actionButton({
       key: 'edit', 'aria-label': t('row.manageAria', { id: row.id }), title: t('row.manageHint'),
       disabled: busy !== undefined, onClick: () => onEdit(row.id),
     }, '⋯'),
   ];
   const children = [React.createElement('div', { key: 'row', className: 'wmcp-row' }, rowChildren)];
+  // Secondary actions live on their own line: keeping them in the row pushed the "⋯" entry
+  // past the panel edge, which is what produced the horizontal scrollbar.
+  const secondary = [];
   if (row.state === 'reconnecting' && Number.isFinite(row.reconnect?.nextRetryAt)) {
-    children.push(React.createElement(RetryCountdown, { key: 'countdown', nextRetryAt: row.reconnect.nextRetryAt, attempt: row.reconnect.attempt }));
+    secondary.push(React.createElement(RetryCountdown, { key: 'countdown', nextRetryAt: row.reconnect.nextRetryAt, attempt: row.reconnect.attempt }));
   }
+  if (connecting) {
+    secondary.push(actionButton({
+      key: 'retry', disabled: busy !== undefined || row.error === 'CLOSE_UNCONFIRMED',
+      onClick: () => onAct('connect'),
+    }, t('action.retryNow')));
+  }
+  if (secondary.length > 0) children.push(React.createElement('div', { key: 'secondary', className: 'wmcp-row-actions' }, secondary));
   if (unverified) {
     // No network here: the server simply has not been confirmed for a while, so say that
     // instead of still showing a green claim that may no longer be true.

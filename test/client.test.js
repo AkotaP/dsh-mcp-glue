@@ -1380,6 +1380,26 @@ test('reconnecting rows are amber, show a local countdown, and offer stop and im
   assert.notEqual(statusSignature(status), statusSignature({ ...status, servers: [{ ...row, error: 'AUTH_REQUIRED' }] }));
 });
 
+test('a troubled row keeps every action inside the panel width', async () => {
+  const { exports } = await loadClientBundle();
+  const { ServerRow, CSS } = exports.__internals;
+  const row = {
+    id: 'wire', state: 'reconnecting', tools: [], error: 'ECONNREFUSED',
+    reconnect: { eligible: true, attempt: 21, nextRetryAt: Date.now() + 60000 },
+  };
+  const markup = renderToStaticMarkup(React.createElement(ServerRow, {
+    row, busy: undefined, expanded: false, showPolicy: false,
+    onAct: noop, onToggleExpand: noop, onEdit: noop, probe: {}, onProbe: noop,
+  }));
+  const primary = markup.slice(0, markup.indexOf('wmcp-row-actions'));
+  assert.ok(primary.includes('⋯'), 'the manage entry stays on the primary row');
+  assert.ok(primary.includes('停止连接'));
+  assert.ok(!primary.includes('立即重试'), 'retry now moved off the primary row');
+  assert.match(markup, /wmcp-row-actions/);
+  assert.match(CSS, /\.wmcp-panel\{[^}]*overflow-x:hidden/, 'the panel never grows a horizontal scrollbar');
+  assert.match(CSS, /\.wmcp-row\{[^}]*min-width:0/);
+});
+
 test('a transport the Host refuses comes back as the reason on the form, never as a silent rewrite', async () => {
   const { exports } = await loadClientBundle();
   const { DeclarationWriteView, presetFields, emptyWriteDrafts } = exports.__internals;
