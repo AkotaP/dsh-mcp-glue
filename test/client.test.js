@@ -93,7 +93,6 @@ test('the client half registers zh/en dictionaries and translates through the lo
   // Without a locale service the zh column answers, so an offline render stays readable.
   assert.equal(t('action.connect'), '连接');
   assert.equal(t('row.editAria', { id: 'demo' }), '编辑 demo');
-  assert.equal(t('row.manageAria', { id: 'demo' }), '管理 demo');
   assert.equal(t('missing.key'), 'missing.key');
   // Both columns are complete and the English one carries no leftover Chinese.
   const columns = { zh: dictOf(0), en: dictOf(1) };
@@ -1392,9 +1391,9 @@ test('a troubled row keeps every action inside the panel width', async () => {
     onAct: noop, onToggleExpand: noop, onEdit: noop, probe: {}, onProbe: noop,
   }));
   const primary = markup.slice(0, markup.indexOf('wmcp-row-actions'));
-  assert.ok(primary.includes('⋯'), 'the manage entry stays on the primary row');
   assert.ok(primary.includes('停止连接'));
   assert.ok(!primary.includes('立即重试'), 'retry now moved off the primary row');
+  assert.ok(!primary.includes('⋯'), 'the server name is the only entry into the editor');
   assert.match(markup, /wmcp-row-actions/);
   assert.match(CSS, /\.wmcp-panel\{[^}]*overflow-x:hidden/, 'the panel never grows a horizontal scrollbar');
   assert.match(CSS, /\.wmcp-row\{[^}]*min-width:0/);
