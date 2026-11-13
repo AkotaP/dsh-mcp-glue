@@ -144,6 +144,27 @@ test('scoped registration overlays preserve every definition field, receivers, i
   assert.equal(ctx.mcpResources.request('bridge', { method: 'resources/list' }, exec(owner)), 'global-resource');
 });
 
+test('a status cell supersedes lifecycle text entirely, so wording drift cannot double-report', async t => {
+  const ctx = await harness(t), { logger } = sink(), events = [];
+  let deliver, inner;
+  const cell = {
+    current: () => ({ state: 'connected', toolCount: 1 }),
+    onChange(callback) { deliver = callback; return () => { deliver = undefined; }; },
+  };
+  const native = { name: 'mcp-client', inject: ['tools'], connectionStatusOf: () => cell, async apply(child) { inner = child; } };
+  const fiber = ctx.plugin(createNativeAdapter(native, { logger, serverName: 'drift', onEvent: event => events.push(event) }), {});
+  await fiber;
+  assert.deepEqual(events, [{ kind: 'status', status: { state: 'connected', toolCount: 1 } }]);
+  // Once the cell is live it is the only lifecycle source: exact text that used to mean
+  // "connection lost" or "cleanup incomplete" must produce nothing at all.
+  inner.logger.error('mcp-client(drift): connection lost and reconnect is disabled — wording may drift');
+  inner.logger.error('mcp-client(drift): cleanup incomplete');
+  assert.deepEqual(events, [{ kind: 'status', status: { state: 'connected', toolCount: 1 } }]);
+  deliver({ state: 'failed', reason: 'reconnect-disabled' });
+  assert.deepEqual(events.at(-1), { kind: 'status', status: { state: 'failed', reason: 'reconnect-disabled' } });
+  await dispose(fiber);
+});
+
 test('only exact verified native lifecycle records emit events; every native log is redacted', async t => {
   const ctx = await harness(t), { logger, records } = sink(), events = [];
   const label = 'mcp-client(logs)';

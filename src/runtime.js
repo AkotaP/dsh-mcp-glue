@@ -1071,7 +1071,23 @@ export class WorkspaceMcpSession {
     const probe = this.nativePlugin?.probeServer;
     if (typeof probe !== 'function') throw Object.assign(new Error('workspace-mcp: the loaded MCP bridge cannot probe servers'), { code: 'PROBE_UNSUPPORTED' });
     this.noteActivity();
-    return probe.call(this.nativePlugin, this.scopeOwner, entry.spec.config, { timeoutMs: this.config.probeTimeoutMs ?? 10000 });
+    const outcome = await probe.call(this.nativePlugin, this.scopeOwner, entry.spec.config, { timeoutMs: this.config.probeTimeoutMs ?? 10000 });
+    // The probe is the only MCP-level evidence available on demand, so let it settle this
+    // row's confidence. A success confirms the session; a failure only withholds the green
+    // claim, because a short budget or a busy server is not proof that the live mount died.
+    const record = this.mounts.get(serverId);
+    if (record !== undefined && this.serverStates.get(serverId)?.state === SERVER_STATES.connected && this.current(record)) {
+      if (outcome?.ok === true) {
+        record.confirmed = true;
+        record.probeFailures = 0;
+        record.lastVerifiedAt = this.clock.now();
+        this.viewRecord(record, SERVER_STATES.connected);
+      } else if (record.confirmed !== false) {
+        record.confirmed = false;
+        this.viewRecord(record, SERVER_STATES.connected);
+      }
+    }
+    return outcome;
   }
   /** Model-facing tool names this server currently publishes in the Agent scope. */
   toolNamesFor(serverName) {

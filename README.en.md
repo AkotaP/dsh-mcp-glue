@@ -6,9 +6,9 @@ Loads project-level MCP declarations for **DeepSeek Harness 0.2.2-rc.2** (retain
 
 ## 0.3.2: DSH 0.2.2-rc.2 compatibility, native connection status, and probe
 
-- Observes `connectionStatusOf(fiber)` from `dsh-mcp-client` 0.2.2+: disconnect, reconnect, failure reason and cleanup result come from the native state machine. Older releases keep the log-text fallback, and an unadaptable bridge falls back to native behaviour.
+- Observes `connectionStatusOf(fiber)` from `dsh-mcp-client` 0.2.2+: disconnect, reconnect, failure reason and cleanup result come from the native state machine. **Once that subscription succeeds, lifecycle log text is not consulted at all** — one source of truth, so wording drift cannot produce duplicate events. Only releases without that surface use the log-text fallback, and an unadaptable bridge falls back to native behaviour.
 - Closure confirmation now reads the status cell's `closure()`: `closeConfirmed: false` or a `cleanupError` marks `CLOSE_UNCONFIRMED`. 0.2.2 replaced the two sentences the text path used with `cleanup incomplete`, so the old logic could no longer block an overlapping process on rc.2.
-- Every panel row offers "Test connection": the native `probeServer()` performs a real MCP handshake and tool listing (stdio and HTTP), registering no tools, reserving no name, and leaving the live connection untouched; it reports server identity, tool count and duration.
+- Every panel row offers "Test connection": the native `probeServer()` performs a real MCP handshake and tool listing (stdio and HTTP), registering no tools, reserving no name, and leaving the live connection untouched; it reports server identity, tool count and duration, and it settles that row's confidence — a success renews the MCP-level confirmation, a failure only withdraws the green claim without tearing the connection down.
 - Fixes panel placement: the popover now portals to `document.body`, so a transform/contain on the composer row cannot displace it; it follows the MCP chip.
 - The 0.3.1 assembly adaptation (0.2.2 freezes executable tools before prompt assembly; the `system-prompt/assemble` waterfall no longer has `tools`) is unchanged.
 

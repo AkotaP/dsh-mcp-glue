@@ -67,8 +67,10 @@ test('a probe treats any HTTP answer as alive and only network failures as gone'
 /** One HTTP server mounted through a native bridge stub of the verified shape. */
 async function fixture(t) {
   const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'health-owner');
-  const clock = fakeClock(), probe = { reachable: true }, logs = [];
-  const nativePlugin = { name: 'mcp-client', inject: ['tools'], async apply(child, config) {
+  const clock = fakeClock(), probe = { reachable: true, mcpOk: true }, logs = [];
+  const nativePlugin = { name: 'mcp-client', inject: ['tools'],
+    async probeServer() { return probe.mcpOk ? { ok: true, toolNames: ['identity'], durationMs: 3, closeConfirmed: true } : { ok: false, stage: 'connect', message: 'unreachable', closeConfirmed: true }; },
+    async apply(child, config) {
     child.tools.register({
       name: `mcp__${config.serverName}__identity`, description: 'health fixture',
       parameters: { type: 'object', properties: {} }, execute: () => 'ok',
@@ -146,4 +148,26 @@ test('stdio servers are never probed, and a pre-call check never waits on a fres
   const fresh = await f.state.verifyBeforeCall('wire', signal());
   assert.equal(fresh, undefined, 'a stdio call is never delayed by a probe');
   assert.equal(await f.state.verifyBeforeCall('missing', signal()), undefined);
+});
+
+test('an on-demand probe settles the confidence it measured without tearing the mount down', async t => {
+  const f = await fixture(t);
+  await f.state.reconcile(signal());
+  f.probe.reachable = false;
+  f.clock.tick(HEALTH.hotMs);
+  await drain(f.state);
+  assert.equal((await rowOf(f.state)).verified, false, 'the heartbeat withheld the green claim');
+
+  // The reachability probe cannot see a healthy MCP session behind a filtered HEAD; the
+  // one-shot handshake can, and it is the only on-demand evidence available.
+  assert.equal((await f.state.probe('wire')).ok, true);
+  assert.equal((await rowOf(f.state)).verified, true);
+  assert.equal((await rowOf(f.state)).state, 'connected');
+
+  f.probe.mcpOk = false;
+  f.probe.reachable = true;
+  assert.equal((await f.state.probe('wire')).ok, false);
+  const row = await rowOf(f.state);
+  assert.equal(row.state, 'connected', 'a failed probe is not proof that the live mount died');
+  assert.equal(row.verified, false, 'but it withdraws the green claim');
 });

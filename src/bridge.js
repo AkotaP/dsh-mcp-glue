@@ -146,7 +146,14 @@ export function createNativeAdapter(nativePlugin, { onEvent, logger, serverName 
         ['transport closure could not be confirmed during disposal', { kind: 'unsafe-close', code: 'CLOSE_UNCONFIRMED' }],
         ['cleanup incomplete', { kind: 'unsafe-close', code: 'CLOSE_UNCONFIRMED' }],
       ]);
+      /**
+       * Text is only a fallback for releases without a status cell. Once the cell is
+       * subscribed below it is the single source of truth, so a routine wording change
+       * upstream can never emit a stray lifecycle event on top of it.
+       */
+      let hasStatusCell = false;
       const lifecycleOf = text => {
+        if (hasStatusCell) return undefined;
         if (typeof text !== 'string' || !text.startsWith(`${label}: `)) return undefined;
         const message = text.slice(label.length + 2);
         for (const [prefix, event] of lifecycle) if (message.startsWith(prefix)) return event;
@@ -223,6 +230,7 @@ export function createNativeAdapter(nativePlugin, { onEvent, logger, serverName 
           if (status !== undefined && typeof status.onChange === 'function') {
             const off = status.onChange(next => emit({ kind: 'status', status: next }));
             ctx.effect(() => off);
+            hasStatusCell = true;
             emit({ kind: 'status', status: status.current() });
           }
         } catch { /* an unreadable status must never break the connection */ }

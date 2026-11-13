@@ -6,9 +6,9 @@
 
 ## 0.3.2：DSH 0.2.2-rc.2 兼容、原生连接状态与「测试连接」
 
-- 接入 `dsh-mcp-client` 0.2.2+ 的 `connectionStatusOf(fiber)`：断线、重连、失败原因与清理结果直接读原生状态机；旧版本继续用日志文本兜底，无法适配时回退原生行为。
+- 接入 `dsh-mcp-client` 0.2.2+ 的 `connectionStatusOf(fiber)`：断线、重连、失败原因与清理结果直接读原生状态机；**订阅成功后不再解析生命周期日志**（单一事实来源，措辞漂移不会叠出重复事件），只有无此接口的旧版本才用日志文本兜底，无法适配时回退原生行为。
 - 关闭确认改读状态单元的 `closure()`：`closeConfirmed: false` 或 `cleanupError` 一律标记 `CLOSE_UNCONFIRMED`。0.2.2 移除了原先匹配的两句关闭日志（改说 `cleanup incomplete`），旧逻辑在 rc.2 上无法再拦截重叠进程。
-- 面板每行新增「测试连接」：调用原生 `probeServer()` 完成一次真实 MCP 握手与工具列表（stdio 与 HTTP 均可），不注册工具、不占用服务器名、不影响现有连接，返回服务器身份、工具数与耗时。
+- 面板每行新增「测试连接」：调用原生 `probeServer()` 完成一次真实 MCP 握手与工具列表（stdio 与 HTTP 均可），不注册工具、不占用服务器名、不影响现有连接，返回服务器身份、工具数与耗时；成功即刷该行的 MCP 级确认，失败只撤绿、不拆连接。
 - 修复面板定位：弹层 portal 到 `document.body`，不再被输入框工具行的 transform/contain 影响，位置始终跟随 MCP 按钮。
 - 0.3.1 的组装适配（0.2.2 在提示词组装前固定本步可执行工具，`system-prompt/assemble` 不含 `tools`）保持不变。
 
