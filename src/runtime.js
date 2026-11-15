@@ -129,6 +129,8 @@ export class WorkspaceMcpSession {
     this.group = undefined; this.loadedFingerprint = undefined;
     this.diagnosticFingerprint = undefined; this.requiredFailure = false;
     this.plan = undefined;
+    /** When the declaration set last changed, so a hand edit can be told apart from a reconnect. */
+    this.lastDeclarationChangeAt = undefined;
     /** 'auto' follows the policy; 'custom' loads exactly `selection`, which panel actions set. */
     this.selectionMode = 'auto'; this.selection = new Set();
     /** Policy layer for this generation: what may load, whether the directory is trusted, and its allowances. */
@@ -302,11 +304,34 @@ export class WorkspaceMcpSession {
    * provider — the plain local filesystem — which is writable.
    */
   canWriteWorkspace() {
+    const policy = this.optionalServices.sandboxPolicy;
+    // No policy service means the unfenced local filesystem, which is always writable.
+    if (policy === undefined) return true;
     try {
-      const policy = this.optionalServices.sandboxPolicy;
-      const mode = policy?.resolve?.({ session: this.agent.session })?.mode;
+      const mode = policy.resolve?.({ session: this.agent.session })?.mode;
       return mode === undefined || mode !== 'read-only';
-    } catch { return true; }
+    } catch {
+      // A policy this session cannot resolve is not permission to write: fail closed, so the
+      // panel keeps its editor shut instead of advertising a save the sandbox would refuse.
+      return false;
+    }
+  }
+  /**
+   * The per-call sandbox policy a declaration write must carry.
+   *
+   * A sandboxed filesystem fences every mutation by the policy supplied with the call. Without
+   * one it falls back to the deployment default, whose workspace root is NOT this session's
+   * workspace, so a save inside the workspace is denied. The session is the boundary.
+   * @returns the resolved policy for this session, or undefined when nothing fences writes.
+   */
+  writePolicy() {
+    const policy = this.optionalServices.sandboxPolicy;
+    if (policy === undefined) return undefined;
+    try { return policy.resolve?.({ session: this.agent.session }); }
+    catch (error) {
+      this.logger.warn(`workspace-mcp: sandbox policy unresolved: ${error?.message ?? error}`);
+      return undefined;
+    }
   }
   /** The declaration files behind this session, shaped for the editor panel. */
   async declarationTargets(signal) {
@@ -314,7 +339,7 @@ export class WorkspaceMcpSession {
     const plan = this.plan ?? await this.preview(signal);
     if (!fs || !plan) return { writable: false, reason: '这个会话还没读到工作区声明', targets: [] };
     const writable = this.canWriteWorkspace();
-    const editor = createDeclarationEditor({ fs, config: this.config });
+    const editor = createDeclarationEditor({ fs, config: this.config, policy: () => this.writePolicy() });
     const [targets, presets] = await Promise.all([editor.list(plan, signal), editor.presets(plan, signal)]);
     return {
       writable,
@@ -348,7 +373,7 @@ export class WorkspaceMcpSession {
     if (!this.canWriteWorkspace()) {
       throw Object.assign(new Error('当前会话是只读沙箱，不能改工作区里的文件'), { code: 'DECLARATION_READ_ONLY' });
     }
-    return createDeclarationEditor({ fs, config: this.config });
+    return createDeclarationEditor({ fs, config: this.config, policy: () => this.writePolicy() });
   }
   /** The current declaration plan, read on demand when nothing is loaded yet. */
   async planOrPreview(signal) {
@@ -371,8 +396,11 @@ export class WorkspaceMcpSession {
     const fs = this.filesystem();
     const cwd = this.agent.session?.header?.cwd;
     if (!fs || !cwd) return undefined;
-    try { this.plan = await this.load(fs, cwd, this.config, { signal }); }
-    catch (error) { this.logger.warn(`workspace-mcp: ${error.code ?? 'WORKSPACE_READ_FAILED'}`); }
+    try {
+      const loaded = await this.load(fs, cwd, this.config, { signal });
+      if (this.plan?.fingerprint !== loaded.fingerprint) this.lastDeclarationChangeAt = this.clock.now();
+      this.plan = loaded;
+    } catch (error) { this.logger.warn(`workspace-mcp: ${error.code ?? 'WORKSPACE_READ_FAILED'}`); }
     return this.plan;
   }
   /** Management-UI view: declarations, trust state, live connection state. */
@@ -399,6 +427,7 @@ export class WorkspaceMcpSession {
       monitoring: this.monitoring,
       now: this.clock.now(),
       freshnessMs: this.freshnessMs(),
+      lastDeclarationChangeAt: this.lastDeclarationChangeAt,
     });
   }
   /**

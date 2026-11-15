@@ -100,9 +100,15 @@ const setNested = (object, keys, value) => {
  * Build the read/write surface for one workspace.
  * @param fs - the session filesystem, already fenced by its own sandbox provider.
  * @param config - the live plugin config; its presets decide format, table path and field names.
+ * @param policy - the per-call sandbox policy for this session, or a getter returning it. A
+ *   sandboxing backend fences a mutation by the policy passed WITH the write; omitting it makes
+ *   the backend fall back to the deployment default, whose workspace root is not the session's,
+ *   so otherwise valid saves are denied. Not needed for the unfenced local filesystem.
  * @returns list/save/remove, each taking the loader plan the caller already holds.
  */
-export function createDeclarationEditor({ fs, config }) {
+export function createDeclarationEditor({ fs, config, policy }) {
+  /** Resolve the policy at write time: a session switch mid-edit must not reuse a stale fence. */
+  const sandboxPolicy = () => (typeof policy === 'function' ? policy() : policy);
   /** The plan entry and its recorded origin: preset id, file, and the declaration's own key. */
   const locate = (plan, serverId) => {
     const entry = (plan?.servers ?? []).find(item => item.spec.config.serverName === serverId);
@@ -164,7 +170,8 @@ export function createDeclarationEditor({ fs, config }) {
   /** Re-read a candidate the way the loader will, before anything is written. */
   const assertReadable = (text, preset, source, expectPresent) => {
     let doc;
-    try { doc = parseDeclaration(text, preset.format); } catch { throw failure('DECLARATION_INVALID', '改完之后解析不通过，已放弃这次修改'); }
+    try { doc = parseDeclaration(text, preset.format); }
+    catch (error) { throw failure('DECLARATION_INVALID', `改完之后解析不通过，已放弃这次修改：${error?.detail ?? '格式错误'}`); }
     if (!isRecord(doc)) throw failure('DECLARATION_INVALID', '改完之后文件根不是对象，已放弃这次修改');
     let found = true;
     try { locateRaw(doc, preset, source); } catch { found = false; }
@@ -180,11 +187,12 @@ export function createDeclarationEditor({ fs, config }) {
    * target, so retrying once with the same version token cannot lose an edit or defeat the guard.
    */
   const writeWithRetry = async (target, content, expected, signal) => {
-    try { return await fs.writeText(target, content, expected, signal); }
+    const attempt = () => fs.writeText(target, content, expected, signal, sandboxPolicy());
+    try { return await attempt(); }
     catch (error) {
       if (error?.code !== 'EIO') throw error;
       await new Promise(resolve => setTimeout(resolve, 60));
-      return fs.writeText(target, content, expected, signal);
+      return attempt();
     }
   };
   /**

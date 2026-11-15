@@ -314,6 +314,33 @@ test('a new remote server can be created with its transport', async t => {
     mcpServers: { remote: { type: 'http', url: 'https://x.test/mcp' } },
   });
 });
+test('a declaration write carries this session sandbox policy into the filesystem', async t => {
+  const ctx = await harness(t);
+  const dir = await workspace(t);
+  await writeFixture(dir, '.mcp.json', '{ "mcpServers": { "demo": { "command": "node" } } }');
+  const plan = await loadWorkspace(ctx.fs, dir, {});
+  // Stand in for `SandboxedFileSystem`: a mutation without an explicit policy is fenced by the
+  // deployment workspace root, which is not this session's, so the save would be denied.
+  const fenced = Object.create(ctx.fs);
+  const calls = [];
+  fenced.writeText = async (target, content, expected, signal, policy) => {
+    calls.push(policy);
+    if (policy?.mode !== 'workspace-write' || policy.workspaceRoot !== dir) {
+      throw Object.assign(new Error('cannot write: file access denied under workspace-write mode'), { code: 'FS_SANDBOX_DENIED' });
+    }
+    return ctx.fs.writeText(target, content, expected, signal);
+  };
+  const editor = createDeclarationEditor({
+    fs: fenced, config: {},
+    policy: () => ({ mode: 'workspace-write', workspaceRoot: dir }),
+  });
+  const [target] = await editor.list(plan, signal());
+  await editor.save(plan, 'demo', [{ name: 'command', value: 'bun' }], signal(), target.version);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].workspaceRoot, dir, 'the write is fenced by the session, not by the deployment default');
+  assert.match(await text(dir, '.mcp.json'), /bun/);
+});
+
 test('a custom preset decides for itself whether it has a transport', async t => {
   const config = {
     enabledBuiltins: [],

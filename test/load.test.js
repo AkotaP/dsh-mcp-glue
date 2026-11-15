@@ -69,6 +69,34 @@ test('invalid files/unsafe paths/limits give content-free diagnostics, and finge
   assert.equal((await loadWorkspace(ctx.fs, dir, { maxFileBytes: 1024 })).servers.length, 0);
 });
 
+test('a syntax error names its line, and an unresolved variable names itself', async t => {
+  const ctx = await harness(t), dir = await workspace(t);
+  await writeFixture(dir, '.mcp.json', '{\n  "mcpServers": {\n    "demo": { "command" "node" }\n  }\n}');
+  const broken = await loadWorkspace(ctx.fs, dir);
+  assert.equal(broken.diagnostics[0].code, 'INVALID_DECLARATION');
+  assert.match(broken.diagnostics[0].detail, /第 3 行/, 'a hand edit needs the place, not just a code');
+  await writeFixture(dir, '.mcp.json', { mcpServers: { demo: { command: '${env:ABSENT_VARIABLE}' } } });
+  const missing = await loadWorkspace(ctx.fs, dir);
+  assert.equal(missing.diagnostics[0].code, 'MISSING_ENVIRONMENT_VARIABLE');
+  assert.match(missing.diagnostics[0].detail, /ABSENT_VARIABLE/);
+});
+
+test('a Windows shim command is reported, and rewriting it is opt-in', async t => {
+  const ctx = await harness(t), dir = await workspace(t);
+  await writeFixture(dir, '.mcp.json', { mcpServers: { demo: { command: 'npx', args: ['-y', 'pkg'] } } });
+  const warned = await loadWorkspace(ctx.fs, dir, {}, { platform: 'win32' });
+  assert.equal(warned.servers.length, 1, 'the warning never blocks loading');
+  assert.equal(warned.warnings[0].code, 'WINDOWS_SHIM_COMMAND');
+  assert.match(warned.warnings[0].detail, /EINVAL/);
+  assert.equal(warned.servers[0].spec.config.command, 'npx', 'the declaration is untouched');
+  assert.equal((await loadWorkspace(ctx.fs, dir, {}, { platform: 'linux' })).warnings.length, 0);
+
+  const rewritten = await loadWorkspace(ctx.fs, dir, { windowsShim: 'rewrite' }, { platform: 'win32' });
+  assert.equal(rewritten.warnings[0].code, 'WINDOWS_SHIM_REWRITTEN');
+  assert.equal(rewritten.servers[0].spec.config.command, 'cmd');
+  assert.deepEqual(rewritten.servers[0].spec.config.args.slice(0, 4), ['/d', '/s', '/c', 'npx']);
+});
+
 test('canonical junction/symlink escape is rejected before reading contents', async t => {
   const ctx = await harness(t), dir = await workspace(t), outside = await workspace(t);
   await writeFixture(outside, 'mcp.json', { servers: { escape: { command: 'x' } } });

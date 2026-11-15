@@ -4,20 +4,33 @@ import { createHash } from 'node:crypto';
 import { COMMON_FIELDS, select } from './presets.js';
 
 export class DeclarationError extends Error {
-  constructor(code) { super(code); this.code = code; }
+  /**
+   * @param code - the stable code a caller may switch on.
+   * @param detail - the field, key, variable or value that failed, phrased for the declaration's
+   *   author: a bare code leaves a hand edit with no idea which line to change.
+   */
+  constructor(code, detail) {
+    super(code);
+    this.code = code;
+    if (detail !== undefined) this.detail = detail;
+  }
 }
-const fail = code => { throw new DeclarationError(code); };
+const fail = (code, detail) => { throw new DeclarationError(code, detail); };
 export const isRecord = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const string = v => typeof v === 'string' && v.length > 0;
-const list = (v, code) => { if (v === undefined) return undefined; if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) fail(code); return v; };
+const list = (v, code, field) => {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) fail(code, field === undefined ? '值必须是字符串数组' : `${field} 必须是字符串数组`);
+  return v;
+};
 
 export function interpolate(text, context, mode = 'standard') {
-  if (typeof text !== 'string') fail('INVALID_STRING');
+  if (typeof text !== 'string') fail('INVALID_STRING', `期望字符串，收到 ${typeof text}`);
   if (mode === 'none') return text;
   const getEnv = (key, fallback) => {
     if (Object.hasOwn(context.env, key) && context.env[key] !== undefined) return context.env[key];
     if (fallback !== undefined) return fallback;
-    fail('MISSING_ENVIRONMENT_VARIABLE');
+    fail('MISSING_ENVIRONMENT_VARIABLE', `变量 ${key} 没有值`);
   };
   const expand = token => {
     if (token === 'workspaceFolder') return context.cwd;
@@ -27,12 +40,12 @@ export function interpolate(text, context, mode = 'standard') {
     if (token === 'configDir') return context.configDir;
     if (token.startsWith('input:')) {
       const id = token.slice(6);
-      if (!Object.hasOwn(context.inputs ?? {}, id)) fail('MISSING_INPUT_VALUE');
+      if (!Object.hasOwn(context.inputs ?? {}, id)) fail('MISSING_INPUT_VALUE', `input:${id} 没有配置值`);
       return context.inputs[id];
     }
     const raw = token.startsWith('env:') ? token.slice(4) : token;
     const match = /^([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?$/s.exec(raw);
-    if (!match) fail('UNSUPPORTED_VARIABLE');
+    if (!match) fail('UNSUPPORTED_VARIABLE', `不认识的变量写法 \${${raw}}`);
     return getEnv(match[1], match[2]);
   };
   // One pass: a secret containing "$..." is data, never recursively expanded.
@@ -43,91 +56,96 @@ export function interpolate(text, context, mode = 'standard') {
 }
 function dictionary(v, expand, code, { numbers = false } = {}) {
   if (v === undefined) return {};
-  if (!isRecord(v)) fail(code);
+  if (!isRecord(v)) fail(code, '必须是一个对象');
   const result = {};
   for (const [key, value] of Object.entries(v)) {
     if (typeof value === 'string') Object.defineProperty(result, key, { value: expand(value), enumerable: true, writable: true, configurable: true });
     else if (numbers && typeof value === 'number' && Number.isFinite(value)) Object.defineProperty(result, key, { value: String(value), enumerable: true, writable: true, configurable: true });
-    else fail(code);
+    else fail(code, `${key} 的值必须是字符串${numbers ? '或数字' : ''}`);
   }
   return result;
 }
-const positive = (v, code) => { if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > 2147483647) fail(code); return v; };
+const positive = (v, code, field) => {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > 2147483647) fail(code, `${field} 必须是正的有限数，收到 ${String(v)}`);
+  return v;
+};
 
 /** Convert supported semantics only. Unsupported security/auth fields fail closed. */
 export function normalizeServer(rawName, raw, preset, context, fileEnv = {}) {
-  if (!isRecord(raw)) fail('INVALID_SERVER');
+  if (!isRecord(raw)) fail('INVALID_SERVER', `${rawName} 的条目必须是一个对象`);
   const fields = { ...COMMON_FIELDS, ...preset.fields };
   const get = key => fields[key] === undefined || (key === 'transport' && fields[key] === '')
     ? undefined : select(raw, fields[key]);
-  for (const key of ['enabled', 'disabled']) if (get(key) !== undefined && typeof get(key) !== 'boolean') fail('INVALID_ENABLED_FLAG');
+  for (const key of ['enabled', 'disabled']) if (get(key) !== undefined && typeof get(key) !== 'boolean') fail('INVALID_ENABLED_FLAG', `${fields[key]} 必须是布尔值`);
   if (get('enabled') === false || get('disabled') === true) return undefined;
   // These fields change authentication, execution location, or security policy.
   for (const key of ['oauth', 'auth', 'authProviderType', 'headersHelper', 'http_headers_helper', 'experimental_environment', 'default_tools_approval_mode', 'tools']) {
-    if (Object.hasOwn(raw, key)) fail('UNSUPPORTED_AUTH_OR_POLICY');
+    if (Object.hasOwn(raw, key)) fail('UNSUPPORTED_AUTH_OR_POLICY', `字段 ${key} 会改变鉴权、执行位置或安全策略，插件不会静默降级，请手动移除或改用受支持的写法`);
   }
-  if (raw.sandboxEnabled === true || Object.hasOwn(raw, 'sandbox')) fail('UNSUPPORTED_SANDBOX');
+  if (raw.sandboxEnabled === true || Object.hasOwn(raw, 'sandbox')) fail('UNSUPPORTED_SANDBOX', '服务器级 sandbox 策略暂不支持');
   const serverName = normalizeServerName(rawName);
   const expand = value => interpolate(value, context, preset.interpolation ?? 'standard');
   let transport = get('transport');
-  if (transport !== undefined && typeof transport !== 'string') fail('INVALID_TRANSPORT');
+  if (transport !== undefined && typeof transport !== 'string') fail('INVALID_TRANSPORT', `type 必须是字符串，收到 ${typeof transport}`);
   if (transport === 'http') transport = 'streamable-http';
   if (!transport) {
     if (get('command') !== undefined) transport = 'stdio';
     else if (get('url') !== undefined) transport = 'streamable-http';
-    else if (preset.dialect === 'gemini' && raw.url !== undefined) fail('UNSUPPORTED_SSE');
+    else if (preset.dialect === 'gemini' && raw.url !== undefined) fail('UNSUPPORTED_SSE', 'URL 形式的 SSE 暂不支持，请改用 streamable-http');
   }
-  if (transport !== 'stdio' && transport !== 'streamable-http') fail(transport === 'sse' ? 'UNSUPPORTED_SSE' : 'UNSUPPORTED_TRANSPORT');
+  if (transport !== 'stdio' && transport !== 'streamable-http') fail(transport === 'sse' ? 'UNSUPPORTED_SSE' : 'UNSUPPORTED_TRANSPORT', `不支持的调用方式：${String(transport)}`);
   const config = { serverName, transport, failOnStartupError: true };
-  if (get('timeoutMs') !== undefined) config.toolCallTimeoutMs = positive(get('timeoutMs'), 'INVALID_TIMEOUT');
-  else if (get('timeoutSeconds') !== undefined) config.toolCallTimeoutMs = positive(get('timeoutSeconds') * 1000, 'INVALID_TIMEOUT');
+  if (get('timeoutMs') !== undefined) config.toolCallTimeoutMs = positive(get('timeoutMs'), 'INVALID_TIMEOUT', fields.timeoutMs);
+  else if (get('timeoutSeconds') !== undefined) config.toolCallTimeoutMs = positive(get('timeoutSeconds') * 1000, 'INVALID_TIMEOUT', fields.timeoutSeconds);
   else if (preset.dialect === 'gemini') config.toolCallTimeoutMs = 600000;
   if (transport === 'stdio') {
-    if (!string(get('command')) || get('url') !== undefined || (preset.dialect === 'gemini' && raw.url !== undefined)) fail('AMBIGUOUS_TRANSPORT');
+    if (!string(get('command')) || get('url') !== undefined || (preset.dialect === 'gemini' && raw.url !== undefined)) fail('AMBIGUOUS_TRANSPORT', 'command 与 url 只能声明一个：它们分别代表本地进程和远程端点');
     config.command = expand(get('command'));
-    if (!config.command || config.command.includes('\0')) fail('INVALID_COMMAND');
-    config.args = (list(get('args'), 'INVALID_ARGS') ?? []).map(expand);
+    if (!config.command || config.command.includes('\0')) fail('INVALID_COMMAND', 'command 为空或含 NUL 字节');
+    config.args = (list(get('args'), 'INVALID_ARGS', 'args') ?? []).map(expand);
     config.cwd = get('cwd') === undefined ? context.cwd : path.resolve(context.cwd, expand(get('cwd')));
     if (config.command.startsWith('.') || config.command.includes('/') || config.command.includes('\\')) config.command = path.resolve(config.cwd, config.command);
-    if (config.args.some(arg => arg.includes('\0')) || config.cwd.includes('\0')) fail('INVALID_PROCESS_ARGUMENT');
+    if (config.args.some(arg => arg.includes('\0')) || config.cwd.includes('\0')) fail('INVALID_PROCESS_ARGUMENT', 'args 或 cwd 含 NUL 字节');
     config.env = { ...fileEnv };
     const vars = get('envVars');
     if (vars !== undefined) {
-      if (!Array.isArray(vars)) fail('INVALID_ENV_VARS');
+      if (!Array.isArray(vars)) fail('INVALID_ENV_VARS', 'env_vars 必须是数组');
       for (const item of vars) {
         const key = typeof item === 'string' ? item : isRecord(item) && (item.source === undefined || item.source === 'local') ? item.name : undefined;
-        if (!string(key)) fail('UNSUPPORTED_REMOTE_ENV');
-        if (context.env[key] === undefined) fail('MISSING_ENVIRONMENT_VARIABLE');
+        if (!string(key)) fail('UNSUPPORTED_REMOTE_ENV', `env_vars 只支持本地变量；收到 ${JSON.stringify(item)}`);
+        if (context.env[key] === undefined) fail('MISSING_ENVIRONMENT_VARIABLE', `变量 ${key} 没有值（env_vars 引用了它）`);
         Object.defineProperty(config.env, key, { value: context.env[key], enumerable: true, writable: true, configurable: true });
       }
     }
     config.env = { ...config.env, ...dictionary(get('env'), expand, 'INVALID_ENV', { numbers: true }) };
-    if (Object.values(config.env).some(v => v.includes('\0')) || Object.keys(config.env).some(k => k.includes('=') || k.includes('\0'))) fail('INVALID_ENV');
+    if (Object.values(config.env).some(v => v.includes('\0')) || Object.keys(config.env).some(k => k.includes('=') || k.includes('\0'))) fail('INVALID_ENV', 'env 的键不能含 = 或 NUL，值不能含 NUL');
   } else {
-    if (get('command') !== undefined || get('env') !== undefined || get('envFile') !== undefined || get('envVars') !== undefined) fail('AMBIGUOUS_TRANSPORT');
-    if (!string(get('url'))) fail('INVALID_URL');
+    if (get('command') !== undefined || get('env') !== undefined || get('envFile') !== undefined || get('envVars') !== undefined) fail('AMBIGUOUS_TRANSPORT', '远程服务器不能同时声明 command / env / envFile / envVars');
+    if (!string(get('url'))) fail('INVALID_URL', '远程服务器缺少 url');
     config.url = expand(get('url'));
     let parsed;
-    try { parsed = new URL(config.url); } catch { fail('INVALID_URL'); }
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) fail('UNSUPPORTED_URL');
+    try { parsed = new URL(config.url); } catch { fail('INVALID_URL', `url 无法解析：${config.url}`); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) fail('UNSUPPORTED_URL', '只支持 http/https，且 url 不能内嵌用户名或密码');
     config.headers = dictionary(get('headers'), expand, 'INVALID_HEADERS');
     const envHeaders = dictionary(get('envHeaders'), v => v, 'INVALID_ENV_HEADERS');
     for (const [header, key] of Object.entries(envHeaders)) {
-      if (context.env[key] === undefined) fail('MISSING_ENVIRONMENT_VARIABLE');
+      if (context.env[key] === undefined) fail('MISSING_ENVIRONMENT_VARIABLE', `变量 ${key} 没有值（env_http_headers 的 ${header} 引用了它）`);
       Object.defineProperty(config.headers, header, { value: context.env[key], enumerable: true, configurable: true, writable: true });
     }
     if (get('bearerTokenEnv') !== undefined) {
       const key = get('bearerTokenEnv');
-      if (!string(key) || context.env[key] === undefined) fail('MISSING_ENVIRONMENT_VARIABLE');
-      if (Object.keys(config.headers).some(k => k.toLowerCase() === 'authorization')) fail('CONFLICTING_AUTH_HEADERS');
+      if (!string(key)) fail('MISSING_ENVIRONMENT_VARIABLE', 'bearer_token_env_var 必须是一个环境变量名');
+      if (context.env[key] === undefined) fail('MISSING_ENVIRONMENT_VARIABLE', `变量 ${key} 没有值（bearer_token_env_var 引用了它）`);
+      if (Object.keys(config.headers).some(k => k.toLowerCase() === 'authorization')) fail('CONFLICTING_AUTH_HEADERS', 'headers 里已经有 Authorization，不能再声明 bearer_token_env_var');
       config.headers.Authorization = `Bearer ${context.env[key]}`;
     }
-    if (Object.entries(config.headers).some(([k, v]) => !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(k) || /[\r\n\0]/.test(v))) fail('INVALID_HEADERS');
+    const invalidHeader = Object.entries(config.headers).find(([k, v]) => !/^[!#$%&'*+.^`|~0-9A-Za-z-]+$/.test(k) || /[\r\n\0]/.test(v));
+    if (invalidHeader !== undefined) fail('INVALID_HEADERS', `头 ${invalidHeader[0]} 的名称或值不合法`);
   }
-  const includeTools = list(preset.dialect === 'codex' ? raw.enabled_tools : raw.includeTools, 'INVALID_TOOL_FILTER');
-  const excludeTools = list(preset.dialect === 'codex' ? raw.disabled_tools : raw.excludeTools, 'INVALID_TOOL_FILTER');
-  if (raw.required !== undefined && typeof raw.required !== 'boolean') fail('INVALID_REQUIRED');
-  const startupTimeoutMs = raw.startup_timeout_sec !== undefined ? positive(raw.startup_timeout_sec * 1000, 'INVALID_TIMEOUT') : undefined;
+  const includeTools = list(preset.dialect === 'codex' ? raw.enabled_tools : raw.includeTools, 'INVALID_TOOL_FILTER', preset.dialect === 'codex' ? 'enabled_tools' : 'includeTools');
+  const excludeTools = list(preset.dialect === 'codex' ? raw.disabled_tools : raw.excludeTools, 'INVALID_TOOL_FILTER', preset.dialect === 'codex' ? 'disabled_tools' : 'excludeTools');
+  if (raw.required !== undefined && typeof raw.required !== 'boolean') fail('INVALID_REQUIRED', 'required 必须是布尔值');
+  const startupTimeoutMs = raw.startup_timeout_sec !== undefined ? positive(raw.startup_timeout_sec * 1000, 'INVALID_TIMEOUT', 'startup_timeout_sec') : undefined;
   const credentialRefs = new Set();
   const inputRefs = new Set();
   const collect = value => {

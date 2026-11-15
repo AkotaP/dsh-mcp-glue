@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { loadWorkspace } from '../src/load.js';
 import { session } from './helpers.js';
 import { agent, fixtureCommand, harness, workspace, writeFixture } from './helpers.js';
 const signal = () => new AbortController().signal;
@@ -37,6 +38,23 @@ test('manual connect loads and lists tools; disconnect unloads and survives auto
   const back = await state.connect(signal());
   assert.equal(back.servers[0].state, 'connected');
   assert.deepEqual(back.selected, ['demo']);
+});
+
+test('a Windows shim command is a row warning, not an invalid declaration', async t => {
+  const ctx = await harness(t), dir = await workspace(t), a = agent(ctx, dir);
+  await writeFixture(dir, '.mcp.json', { mcpServers: { demo: { command: 'npx', args: ['-y', 'pkg'] } } });
+  // The platform is the loader input under test, so an injectable loader pins it everywhere.
+  const state = session(ctx, a, { trustMode: 'manual' }, {
+    load: (fs, cwd, config, options) => loadWorkspace(fs, cwd, config, { ...options, platform: 'win32' }),
+  });
+  t.after(() => state.dispose());
+  const status = await state.status(signal());
+  const row = status.servers.find(entry => entry.id === 'demo');
+  assert.equal(row.state, 'unauthorized', 'a warning never changes the row state');
+  assert.deepEqual(row.warnings.map(item => item.code), ['WINDOWS_SHIM_COMMAND']);
+  assert.equal(status.counts.warnings, 1);
+  assert.equal(status.counts.invalid, 0);
+  assert.ok(Number.isFinite(status.lastDeclarationChangeAt));
 });
 
 test('declaration errors and failed startups are reported per server', { timeout: 30000 }, async t => {

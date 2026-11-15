@@ -112,6 +112,19 @@ test('assembly hook loads approved servers into the very first request and plugi
   assert.equal((await execute(ctx, a)).isError, true);
 });
 
+test('a session whose sandbox policy cannot resolve is not advertised as writable', async t => {
+  const ctx = await harness(t), dir = await workspace(t), a = agent(ctx, dir);
+  await writeFixture(dir, '.mcp.json', { mcpServers: { demo: { command: 'node' } } });
+  const state = session(ctx, a, { trustMode: 'all' }, {
+    optionalServices: { sandboxPolicy: { resolve: () => { throw new Error('unresolvable'); } } },
+  });
+  t.after(() => state.dispose());
+  const targets = await state.declarationTargets(signal());
+  assert.equal(targets.writable, false, 'a policy that cannot resolve is not permission to write');
+  assert.equal(targets.targets.length, 1, 'the declarations stay visible for inspection');
+  await assert.rejects(state.saveDeclaration('demo', [{ name: 'command', value: 'node' }], undefined, signal()), { code: 'DECLARATION_READ_ONLY' });
+});
+
 test('disposal interrupts pending startup and cancelled work never publishes project tools', { timeout: 10000 }, async t => {
   const ctx = await harness(t), dir = await workspace(t), a = agent(ctx, dir);
   await writeFixture(dir, '.mcp.json', { mcpServers: { same: { command: process.execPath, args: ['-e', 'setTimeout(()=>{},60000)'] } } });

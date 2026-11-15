@@ -32,8 +32,15 @@ function safeTarget(approval) {
   };
 }
 
-export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrictions, selected, autoAllowed, selectionMode, mounted, serverStates, requiredFailure, monitoring, now, freshnessMs }) {
+export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrictions, selected, autoAllowed, selectionMode, mounted, serverStates, requiredFailure, monitoring, now, freshnessMs, lastDeclarationChangeAt }) {
   const rows = [];
+  // Warnings describe a loadable server (a Windows shim command, say); they never make it invalid.
+  const warningsByServer = new Map();
+  for (const item of plan?.warnings ?? []) {
+    const list = warningsByServer.get(item.server) ?? [];
+    list.push({ code: item.code, detail: item.detail });
+    warningsByServer.set(item.server, list);
+  }
   const loadable = new Map();
   for (const entry of plan?.servers ?? []) {
     const { serverName, transport } = entry.spec.config;
@@ -73,6 +80,7 @@ export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrict
       tools,
       disabledTools,
       error: live?.error,
+      warnings: warningsByServer.get(serverName) ?? [],
       reconnect: live?.reconnect ?? { eligible: false, attempt: 0, nextRetryAt: null, reason: null },
     });
   }
@@ -87,6 +95,7 @@ export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrict
       state: SERVER_STATES.invalid,
       tools: [],
       error: issue.code,
+      ...(issue.detail === undefined ? {} : { errorDetail: issue.detail }),
     });
   }
   const loaded = mounted === true;
@@ -100,11 +109,16 @@ export function buildStatus({ cwd, plan, trusted, trustMode, allowance, restrict
     selected: selected === undefined ? rows.filter(row => row.selected).map(row => row.id) : [...selected],
     loaded,
     requiredFailure,
+    lastDeclarationChangeAt: lastDeclarationChangeAt ?? null,
     monitoring: monitoring === true ? 'supported' : 'unsupported',
     counts: {
       declarations: rows.length,
       connected: rows.filter(row => row.state === SERVER_STATES.connected).length,
       selected: rows.filter(row => row.selected).length,
+      // A declaration the loader refused is a different problem from one that will not connect,
+      // and a hand edit needs the first number on its own.
+      invalid: rows.filter(row => row.state === SERVER_STATES.invalid).length,
+      warnings: plan?.warnings?.length ?? 0,
       problems: rows.filter(row => row.state !== SERVER_STATES.connected && row.state !== SERVER_STATES.pending && row.state !== SERVER_STATES.unloaded).length,
     },
     servers: rows,

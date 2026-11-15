@@ -69,6 +69,13 @@ test('Gemini URL semantics, security and authentication do not silently degrade'
   assert.throws(() => normalizeServer('bad', { type: 'http', url: 'https://example.test', headers: { X: 'x\nsecret' } }, preset('root'), context));
 });
 
+test('a rejected field says which field, key or variable it was', () => {
+  assert.throws(() => interpolate('${MISSING}', context), error => error.detail === '变量 MISSING 没有值');
+  assert.throws(() => normalizeServer('bad', { command: 'x', env: { PORT: null } }, preset('vscode'), context), error => /PORT/.test(error.detail));
+  assert.throws(() => normalizeServer('bad', { command: 'x', oauth: {} }, preset('root'), context), error => /oauth/.test(error.detail));
+  assert.throws(() => normalizeServer('bad', { command: 'x', args: ['a', 2] }, preset('root'), context), error => /args/.test(error.detail));
+});
+
 test('server namespaces and native public tool names stay stable and collision resistant', () => {
   const names = ['normal', 'bad.name', 'bad/name', '名字', 'a'.repeat(100)].map(normalizeServerName);
   assert.equal(new Set(names).size, names.length);

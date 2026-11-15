@@ -15,6 +15,7 @@ import { installWorkspaceLoader } from './runtime.js';
 import { createControl } from './control.js';
 import { createConfigControl, liveConfig } from './config.js';
 import { installWebControl } from './web.js';
+import { bundledSkill } from './skill.js';
 
 export const name = 'workspace-mcp-glue';
 /** The npm package name: the Loader row specifier, the client bundle id, and the client seat key. */
@@ -63,6 +64,7 @@ export const Config = z.object({
   trustedWorkspaces: z.array(String).default([]).description('受信任的绝对工作区目录：其中一切都允许自动加载；只匹配该目录本身，不含子目录').volatile(),
   workspaceAllowances: z.array(WorkspaceAllowance).default([]).description('按工作区的例外：这个目录里只自动连接这些服务器 / 只免批准这些工具').volatile(),
   inputValues: z.dict(z.string().role('secret')).default({}).description('VS Code ${input:id} 等变量的显式值；不会执行项目 inputs.command'),
+  windowsShim: choice(['warn', 'rewrite']).default('warn').description('Windows 上遇到 .cmd/.bat 或 npx/npm/pnpm/yarn 这类 shell shim 命令：warn 只提示（推荐），rewrite 在内存里改写成 cmd /d /s /c；两种情况都不改声明文件'),
   maxFileBytes: z.number().step(1).min(1024).max(16777216).default(1048576).description('每个声明文件或 envFile 的字节上限'),
   maxServers: z.number().step(1).min(1).max(128).default(32).description('每个工作区最多检查的服务器条目数'),
   startupTimeoutMs: z.number().step(1).min(100).max(300000).default(15000).description('每台服务器启动超时；Codex startup_timeout_sec 优先'),
@@ -99,6 +101,15 @@ export async function apply(ctx, config) {
     resolveLoader: () => services.loader ?? ctx.get('loader'),
   });
   if (!loader) return;
+  // The registry accepts an in-memory skill, so the shipped documentation is available without a
+  // copy into the user's skill directory. A composition without `skills` skips registration.
+  ctx.inject(['skills'], inner => {
+    try { return inner.skills.register(bundledSkill()); }
+    catch (error) {
+      ctx.logger.warn(`workspace-mcp: bundled skill not registered: ${error?.message ?? error}`);
+      return () => {};
+    }
+  });
   if (live.webControl === false) {
     ctx.logger.warn('workspace-mcp: webControl is disabled; the management UI cannot read or change state');
     return;

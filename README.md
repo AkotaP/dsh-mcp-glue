@@ -1,23 +1,8 @@
 # dsh-mcp-glue
 
-[English](README.en.md) | 中文
+[English](README.en.md) | 中文 | [变更记录](CHANGELOG.md)
 
 为 **DeepSeek Harness 0.2.2-rc.2**（保留 `0.2.0-rc.2` / `0.2.1-rc.2` 兼容路径）加载项目级 MCP 声明。一个工作区的会话只读取自己的配置，并在各自 Agent 作用域内连接服务器；不会把配置写入 DSH 全局 profile，也不会修改原声明文件。
-
-## 0.3.3：面板细节修正
-
-- 面板打开时不再先出现在兜底位置再瞬移：改为在绘制前用 `useLayoutEffect` 测量 MCP 按钮，测量完成前保持隐藏。
-- 行始终是一行：重连倒计时并入状态标签（`重连中 · 12s`，等宽数字），尝试次数与传输错误码放进该标签 tooltip；「重试」回到行内，主操作简写为「停止／重试」（完整文案保留在 `title` 与 `aria-label`）。纯网络错误码不再单独占行，只有可操作的失败原因才占一行。
-- 修复面板横向溢出：`overflow-x` 隐藏、行允许收缩，行内不再出现横向滚动条，右侧按钮不会被挤出面板。
-- 移除行内多余的 `⋯`：点击服务器名称本来就是编辑入口，重复的入口只会占宽度并触发上面的溢出。
-
-## 0.3.2：DSH 0.2.2-rc.2 兼容、原生连接状态与「测试连接」
-
-- 接入 `dsh-mcp-client` 0.2.2+ 的 `connectionStatusOf(fiber)`：断线、重连、失败原因与清理结果直接读原生状态机；**订阅成功后不再解析生命周期日志**（单一事实来源，措辞漂移不会叠出重复事件），只有无此接口的旧版本才用日志文本兜底，无法适配时回退原生行为。
-- 关闭确认改读状态单元的 `closure()`：`closeConfirmed: false` 或 `cleanupError` 一律标记 `CLOSE_UNCONFIRMED`。0.2.2 移除了原先匹配的两句关闭日志（改说 `cleanup incomplete`），旧逻辑在 rc.2 上无法再拦截重叠进程。
-- 面板每行新增「测试连接」：调用原生 `probeServer()` 完成一次真实 MCP 握手与工具列表（stdio 与 HTTP 均可），不注册工具、不占用服务器名、不影响现有连接，返回服务器身份、工具数与耗时；成功即刷该行的 MCP 级确认，失败只撤绿、不拆连接。
-- 修复面板定位：弹层 portal 到 `document.body`，不再被输入框工具行的 transform/contain 影响，位置始终跟随 MCP 按钮。
-- 0.3.1 的组装适配（0.2.2 在提示词组装前固定本步可执行工具，`system-prompt/assemble` 不含 `tools`）保持不变。
 
 ## 内置预设
 
@@ -69,6 +54,8 @@
   pnpm add link:<本工程绝对路径>
   ```
 - **tgz 安装**：`pnpm pack` 后在插件界面安装生成的 tgz（`prepack` 会先重建 `lib/client.js`）。
+
+随包还带一个排障 skill：`skills/dsh-mcp-glue/`（`SKILL.md` 与零依赖 CLI `mcpctl.mjs`）。插件激活时用 `ctx.skills.register()` 以 `source: bundled` 注册它，无需复制到 skill 目录；未挂载 `skills` 服务的组合只保留文件本身。同一层内 runtime 注册优先于用户目录的同名技能，因此不要同时保留 `$DSH_HOME/skills/dsh-mcp-glue` 副本。
 
 本包的**运行时代码刻意不 import** 任何 `@deepseek-ai/dsh-*` 模块：作用域身份来自模块私有 Symbol，第二份模块拷贝会让 scoped 注册退化成全局注册。原生 MCP 桥接通过宿主 Cordis loader 按运行时自己的实例加载（详见[调查笔记](<docs/loading-model.md#6-模块实例身份第三方插件的关键约束>)）。
 
@@ -154,7 +141,9 @@ MCP 小面板标题栏提供 **＋新建 / 管理**；**点服务器名称即可
 - **保存与连接分开**：普通保存不会新增连接授权；「保存并连接」才明确请求当前会话连接，stdio 可能启动本地程序。原有的工作区信任 / 自动连接策略仍会生效。
 - **写后校验、失败回滚**：写完立刻用加载器的同一条路径重读一遍；新内容解析不了、条目消失了、或者加载报错，就用宿主交回的原文**逐字节还原**，再把失败原因报给用户。
 - **只写工作区内**：目标路径必须落在当前工作区里。
-- **只读会话不给写**：沙箱是 `read-only` 时会话里入口只读并说明原因；`workspace-write` 及以上才允许保存。
+- **写入跟着会话的沙箱策略走**：每次写入都带上该会话自己解析出的策略。`read-only` 时会话里入口只读并说明原因，接口返回 403 `DECLARATION_READ_ONLY`；`workspace-write` 及以上可以保存工作区内的声明文件。0.3.3 及更早版本没有把会话策略传给文件系统，`workspace-write` 下也会被拒（`FS_SANDBOX_DENIED`），0.4.0 已修复。
+- **诊断带位置与字段**：语法错误给出行列，字段错误点名字段、键或环境变量。`status` 的每行带 `errorDetail`，并新增 `counts.invalid` / `counts.warnings` 与 `lastDeclarationChangeAt`，手改之后能直接判断改动是否被接受。
+- **Windows shim 提示**：`command` 是 `.cmd`/`.bat` 或 `npx`/`npm`/`pnpm`/`yarn` 时，Node 无法直接 spawn（`EINVAL`）。默认只在 `status` 里给 `WINDOWS_SHIM_COMMAND` 警告，不影响加载；`windowsShim` 设为 `rewrite` 时才会在内存里改写成 `cmd /d /s /c`，声明文件始终不变。
 - **这些文件是共享的**：`.mcp.json` 同时被 VS Code / Cursor 读，`.codex/config.toml` 是 Codex 的。「改了哪个文件、哪个键」都会记进宿主日志。
 - **新建服务器**：可以凭空建一台，文件不存在就一并创建（此时连 TOML 都行）。
 - **复制 / 迁移到另一个预设**：把基础连接字段读成规范字段、再按目标预设写出；目标方言不支持的 `transport` 不会写入。含工具过滤、凭证转发或超时等尚未支持转换的高级字段时拒绝复制，防止静默丢失语义；同一物理文件不允许通过预设别名复制到自身。迁移失败时对源和目标均做版本守卫回滚。

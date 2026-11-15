@@ -1,23 +1,8 @@
 # dsh-mcp-glue
 
-[中文](README.md) | English
+[中文](README.md) | English | [Changelog](CHANGELOG.md)
 
 Loads project-level MCP declarations for **DeepSeek Harness 0.2.2-rc.2** (retaining compatibility paths for `0.2.0-rc.2` / `0.2.1-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
-
-## 0.3.3: panel detail fixes
-
-- The panel no longer appears at a fallback offset and then jumps: the MCP chip is measured in a layout effect before paint, and the panel stays hidden until that measurement exists.
-- A row is always one line: the retry countdown lives in the state tag (`Reconnecting · 12s`, tabular digits), with the attempt count and transport code in that tag's tooltip; Retry is back on the row and the primary control reads Stop / Retry (full labels stay in `title` and `aria-label`). A bare transport code no longer earns a line of its own — only actionable failures do.
-- Horizontal overflow fixed: `overflow-x` is hidden and rows may shrink, so the panel never grows a horizontal scrollbar and no control is pushed past its edge.
-- Removed the redundant row `⋯`: clicking a server name already opens the editor, and a duplicate entry only consumed width and caused that overflow.
-
-## 0.3.2: DSH 0.2.2-rc.2 compatibility, native connection status, and probe
-
-- Observes `connectionStatusOf(fiber)` from `dsh-mcp-client` 0.2.2+: disconnect, reconnect, failure reason and cleanup result come from the native state machine. **Once that subscription succeeds, lifecycle log text is not consulted at all** — one source of truth, so wording drift cannot produce duplicate events. Only releases without that surface use the log-text fallback, and an unadaptable bridge falls back to native behaviour.
-- Closure confirmation now reads the status cell's `closure()`: `closeConfirmed: false` or a `cleanupError` marks `CLOSE_UNCONFIRMED`. 0.2.2 replaced the two sentences the text path used with `cleanup incomplete`, so the old logic could no longer block an overlapping process on rc.2.
-- Every panel row offers "Test connection": the native `probeServer()` performs a real MCP handshake and tool listing (stdio and HTTP), registering no tools, reserving no name, and leaving the live connection untouched; it reports server identity, tool count and duration, and it settles that row's confidence — a success renews the MCP-level confirmation, a failure only withdraws the green claim without tearing the connection down.
-- Fixes panel placement: the popover now portals to `document.body`, so a transform/contain on the composer row cannot displace it; it follows the MCP chip.
-- The 0.3.1 assembly adaptation (0.2.2 freezes executable tools before prompt assembly; the `system-prompt/assemble` waterfall no longer has `tools`) is unchanged.
 
 ## Built-in presets
 
@@ -69,6 +54,8 @@ Any one of three paths. All of them place the package in the profile's `node_mod
   pnpm add link:<absolute path to this project>
   ```
 - **tgz install**: run `pnpm pack` and install the generated tgz from the Plugins page (`prepack` rebuilds `lib/client.js` first).
+
+The package also ships a troubleshooting skill at `skills/dsh-mcp-glue/` (`SKILL.md` plus the zero-dependency `mcpctl.mjs` CLI). The plugin registers it with `ctx.skills.register()` as `source: bundled` on activation, so no copy into a skill directory is needed; a composition without the `skills` service keeps only the files. Within one layer a runtime registration outranks a same-name skill in the user directory, so a `$DSH_HOME/skills/dsh-mcp-glue` copy should not be kept alongside.
 
 Runtime code deliberately imports **no** `@deepseek-ai/dsh-*` module: scope identity lives in module-private symbols, and a second copy of those modules turns scoped registrations into global ones. The native MCP bridge is obtained from the Host Cordis loader, which loads the instance the runtime itself uses (see the [investigation notes](<docs/loading-model.md#6-模块实例身份第三方插件的关键约束>)).
 
@@ -154,7 +141,9 @@ The MCP panel's title bar offers **+ New / Manage**; **clicking a server name op
 - **Saving and connecting are separate**: an ordinary save grants no new connection; "Save and connect" explicitly asks the current session to connect, and stdio may start a local program. The workspace trust and auto-connect policy still apply.
 - **Validate after writing, roll back on failure**: the file is re-read through the same loader path immediately; if the new content does not parse, the entry disappeared, or loading fails, the original bytes the Host returned are restored exactly and the reason is reported.
 - **Writes stay inside the workspace**: the target path must lie within the current workspace.
-- **Read-only sessions cannot write**: when the sandbox is `read-only`, the editor is read-only in the session and explains why; `workspace-write` and above may save.
+- **A write follows its session's sandbox policy**: every write carries the policy that session resolves. Under `read-only` the editor is read-only in the session and explains why, and the route answers 403 `DECLARATION_READ_ONLY`; `workspace-write` and above may save a declaration inside the workspace. Up to 0.3.3 the session policy was not passed to the filesystem, so `workspace-write` was refused too (`FS_SANDBOX_DENIED`); 0.4.0 fixes that.
+- **Diagnostics name the place and the field**: a syntax error reports a line and column; a field error names the field, key or environment variable. Each `status` row carries `errorDetail`, and the view adds `counts.invalid` / `counts.warnings` plus `lastDeclarationChangeAt`, so a hand edit can be checked directly.
+- **Windows shim hint**: when `command` is a `.cmd`/`.bat` file or `npx`/`npm`/`pnpm`/`yarn`, Node cannot spawn it directly (`EINVAL`). The default is a `WINDOWS_SHIM_COMMAND` warning in `status` that never blocks loading; setting `windowsShim` to `rewrite` rewrites it in memory to `cmd /d /s /c`, and the declaration file is never touched.
 - **These files are shared**: `.mcp.json` is also read by VS Code and Cursor, and `.codex/config.toml` belongs to Codex. Which file and which key changed is written to the Host log.
 - **New servers**: a server can be created from nothing, creating the file if needed (TOML included).
 - **Copy / migrate to another preset**: the connection fields are read as canonical fields and written for the target preset; a `transport` the target dialect cannot express is not written. Advanced fields that are not yet convertible (tool filters, credential forwarding, timeouts) make the copy fail rather than silently lose meaning; the same physical file may not be copied onto itself through a preset alias. A failed migration rolls the source and the target back under the version guard.
