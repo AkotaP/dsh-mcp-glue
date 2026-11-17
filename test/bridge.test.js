@@ -27,6 +27,9 @@ async function dispose(fiber) {
   while (fiber.inertia !== undefined) await fiber.inertia;
 }
 const httpError = status => new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, 'credential=DO_NOT_LOG', { status, text: 'DO_NOT_LOG' });
+/** The live shape of a dead session: HTTP 400 carrying a JSON-RPC -32600 body as raw text. */
+const sessionLostBody = JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32600, message: 'Session not found' } });
+const sessionLostError = () => new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, 'credential=DO_NOT_LOG', { status: 400, text: sessionLostBody });
 const definition = (name, execute) => ({
   name, description: 'bridge fixture', parameters: { type: 'object', properties: {} },
   output: { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] }, execute,
@@ -63,6 +66,12 @@ test('startup classification reads bounded structured causes, never error-messag
   for (const status of [401, 403]) assert.deepEqual(classifyConnectionError(httpError(status)), { code: 'AUTH_REQUIRED', retryable: false });
   for (const status of [429, 500, 502, 503, 599]) assert.deepEqual(classifyConnectionError(httpError(status)), { code: `HTTP_${status}`, retryable: true });
   assert.deepEqual(classifyConnectionError(httpError(404)), { code: 'SESSION_EXPIRED', retryable: true });
+  assert.deepEqual(classifyConnectionError(sessionLostError()), { code: 'SESSION_EXPIRED', retryable: true });
+  assert.deepEqual(classifyConnectionError(new ProtocolError(-32600, 'Session not found')), { code: 'SESSION_EXPIRED', retryable: true });
+  // A 400 that is a request problem, not a session one, must not become a reconnect.
+  assert.deepEqual(classifyConnectionError(new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, 'credential=DO_NOT_LOG',
+    { status: 400, text: '{"error":{"code":-32602,"message":"Invalid params"}}' })), { code: 'START_FAILED', retryable: true });
+  assert.deepEqual(classifyConnectionError(new ProtocolError(-32600, 'Invalid params')), { code: 'START_FAILED', retryable: true });
   assert.deepEqual(classifyConnectionError(new SdkError(SdkErrorCode.ConnectionClosed, 'secret')), { code: 'CONNECTION_CLOSED', retryable: true });
   const wrapped = new SdkError(SdkErrorCode.EraNegotiationFailed, 'secret', { cause: Object.assign(new Error(), { code: 'EACCES' }) });
   assert.deepEqual(classifyConnectionError(wrapped), { code: 'EACCES', retryable: false });
@@ -208,7 +217,11 @@ test('raw typed tool/provider exceptions are observed before ToolRuntime normali
   const cases = [
     [new SdkError(SdkErrorCode.ConnectionClosed, 'DO_NOT_LOG'), 'CONNECTION_CLOSED', true],
     [httpError(401), 'AUTH_REQUIRED', false], [httpError(403), 'AUTH_REQUIRED', false],
-    [httpError(404), 'SESSION_EXPIRED', true], [httpError(429), 'HTTP_429', true], [httpError(503), 'HTTP_503', true],
+    [httpError(404), 'SESSION_EXPIRED', true], [sessionLostError(), 'SESSION_EXPIRED', true],
+    [new ProtocolError(-32600, 'Session not found'), 'SESSION_EXPIRED', true],
+    [new ProtocolError(-32600, 'Invalid params'), undefined],
+    [new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, 'DO_NOT_LOG', { status: 400, text: '{"error":{"code":-32602,"message":"Invalid params"}}' }), undefined],
+    [httpError(429), 'HTTP_429', true], [httpError(503), 'HTTP_503', true],
     [new Error('outer', { cause: Object.assign(new Error('DO_NOT_LOG'), { code: 'ECONNRESET' }) }), 'ECONNRESET', true],
     [new Error('business ECONNRESET HTTP 401 connection closed'), undefined],
     [new ProtocolError(-32000, 'business', { status: 503 }), undefined],
@@ -248,7 +261,8 @@ async function wireServer(t, { zeroTools = false, startupStatus } = {}) {
     const message = JSON.parse(text);
     state.requests.push(message.method);
     if (startupStatus || state.failure && ['tools/call', 'resources/list', 'resources/read', 'resources/templates/list'].includes(message.method)) {
-      response.writeHead(startupStatus ?? state.failure, { 'content-type': 'text/plain' }).end('DO_NOT_LOG'); return;
+      response.writeHead(startupStatus ?? state.failure, { 'content-type': 'text/plain' })
+        .end(state.failureBody ?? 'DO_NOT_LOG'); return;
     }
     if (message.id === undefined) { response.writeHead(202).end(); return; }
     const result = (() => {
@@ -300,6 +314,13 @@ test('real native scoped tools, resources and image projection work; global nati
   events.length = 0;
   await assert.rejects(() => ctx.mcpResources.request('wire', { method: 'resources/list' }, exec(owner)), error => error instanceof SdkHttpError && error.data.status === 404);
   assert.deepEqual(events.filter(event => event.kind !== 'request-ok'), [{ kind: 'request-failed', code: 'SESSION_EXPIRED', retryable: true }]);
+  // The same dead session reported as HTTP 400 instead of 404 is classified identically, and it
+  // is the body that proves it: a 400 alone is also how bad requests are rejected.
+  state.failure = 400; state.failureBody = sessionLostBody;
+  events.length = 0;
+  assert.equal((await ctx.tools.execute({ name: 'mcp__wire__identity', ...exec(owner) })).isError, true);
+  assert.deepEqual(events.filter(event => event.kind !== 'request-ok'), [{ kind: 'request-failed', code: 'SESSION_EXPIRED', retryable: true }]);
+  state.failure = undefined; state.failureBody = undefined;
   events.length = 0;
   await ctx.tools.execute({ name: 'mcp__wire__identity', ...exec(other) });
   assert.deepEqual(events, [], 'global requests are never intercepted');

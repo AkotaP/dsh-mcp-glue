@@ -14,6 +14,14 @@ const NETWORK_CODES = new Set([
   'ETIMEDOUT', 'ERR_SOCKET_CLOSED', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
 ]);
 const PERMANENT_CODES = new Set(['ENOENT', 'EACCES', 'EPERM']);
+/**
+ * Server wording that identifies a dead MCP session inside a JSON-RPC error answer.
+ *
+ * Matched only against a 400 response body or a -32600 protocol message, never against
+ * arbitrary text: a 400 is also how servers reject malformed requests, and reconnecting
+ * on those would turn a configuration mistake into a retry loop.
+ */
+const SESSION_LOST_TEXT = /session[^"]{0,80}(?:not found|no longer|invalid|expired|unknown|terminated|missing)|no valid session/i;
 
 function isSdkError(error) {
   // SDK 2 uses cross-bundle brands; the names also support older unbranded SDK errors.
@@ -42,6 +50,10 @@ function structuredFailure(chain, startup) {
       || error.name === 'UnauthorizedError') return { code: 'AUTH_REQUIRED', retryable: false };
   }
   for (const error of chain) {
+    // A JSON-RPC error answer (HTTP 200 + error body) carries a numeric protocol code and no
+    // SDK brand at all, so every SdkError check below would skip it.
+    if (typeof error.code === 'number' && error.code === -32600
+      && SESSION_LOST_TEXT.test(error.message ?? '')) return { code: 'SESSION_EXPIRED', retryable: true };
     if (NETWORK_CODES.has(error.code)) return { code: error.code, retryable: true };
     if (!isSdkError(error)) continue;
     if (error.code === 'CONNECTION_CLOSED' || error.code === 'NOT_CONNECTED') {
@@ -49,6 +61,11 @@ function structuredFailure(chain, startup) {
     }
     const status = error.data?.status;
     if (status === 404) return { code: 'SESSION_EXPIRED', retryable: true };
+    // The SDK keeps an HTTP failure body as raw text, not as parsed JSON; real servers answer
+    // a dead session with 400 as well as 404, so read the body before giving up on the status.
+    if (status === 400 && SESSION_LOST_TEXT.test(String(error.data?.text ?? ''))) {
+      return { code: 'SESSION_EXPIRED', retryable: true };
+    }
     if (status === 429 || Number.isInteger(status) && status >= 500 && status <= 599) {
       return { code: `HTTP_${status}`, retryable: true };
     }
