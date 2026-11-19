@@ -61,6 +61,12 @@ test('Codex env forwarding and HTTP credential references use actual environment
   assert.throws(() => normalizeServer('bad', { command: 'x', env_vars: [{ name: 'TOKEN', source: 'remote' }] }, preset('codex'), context));
 });
 
+test('header names accept the RFC 7230 tchar set, including underscore', () => {
+  const named = normalizeServer('idea', { url: 'https://example.test/mcp', headers: { IJ_MCP_SERVER_PROJECT_PATH: '/repo' } }, preset('root'), context);
+  assert.equal(named.config.headers.IJ_MCP_SERVER_PROJECT_PATH, '/repo');
+  assert.throws(() => normalizeServer('bad', { url: 'https://example.test', headers: { 'Bad Name': 'x' } }, preset('root'), context), /INVALID_HEADERS/);
+});
+
 test('Gemini URL semantics, security and authentication do not silently degrade', () => {
   assert.throws(() => normalizeServer('legacy', { url: 'https://example.test/sse' }, preset('gemini'), context), /UNSUPPORTED_SSE/);
   assert.equal(normalizeServer('http', { httpUrl: 'https://example.test/mcp' }, preset('gemini'), context).config.transport, 'streamable-http');
