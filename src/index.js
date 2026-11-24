@@ -68,6 +68,11 @@ export const Config = z.object({
   maxFileBytes: z.number().step(1).min(1024).max(16777216).default(1048576).description('每个声明文件或 envFile 的字节上限'),
   maxServers: z.number().step(1).min(1).max(128).default(32).description('每个工作区最多检查的服务器条目数'),
   startupTimeoutMs: z.number().step(1).min(100).max(300000).default(15000).description('每台服务器启动超时；Codex startup_timeout_sec 优先'),
+  // 0.2.3's bridge can list a server's tools in the prompt and register only the ones an agent
+  // asks for. That is what keeps a workspace with several servers inside its prompt budget, so
+  // it is the default here; the declaration may still override it per server.
+  toolLoading: choice(['eager', 'on-demand']).default('on-demand').description('工具注入方式：on-demand 按需加载（只列目录，多服务器更省上下文），eager 启动即全量注册'),
+  catalogDescriptionMaxLength: z.number().step(1).min(4).max(4096).default(160).description('on-demand 工具目录里每行简介的字符上限'),
   webControl: z.boolean().default(true).description('注册管理 UI 的同源控制路由；关闭后界面仍显示状态但无法手动连接'),
 });
 export async function apply(ctx, config) {

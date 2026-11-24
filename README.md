@@ -2,7 +2,7 @@
 
 [English](README.en.md) | 中文 | [变更记录](CHANGELOG.md)
 
-为 **DeepSeek Harness 0.2.2-rc.2**（保留 `0.2.0-rc.2` / `0.2.1-rc.2` 兼容路径）加载项目级 MCP 声明。一个工作区的会话只读取自己的配置，并在各自 Agent 作用域内连接服务器；不会把配置写入 DSH 全局 profile，也不会修改原声明文件。
+为 **DeepSeek Harness 0.2.3**（`engines.dsh: >=0.2.3-alpha.2`）加载项目级 MCP 声明。一个工作区的会话只读取自己的配置，并在各自 Agent 作用域内连接服务器；不会把配置写入 DSH 全局 profile，也不会修改原声明文件。
 
 ## 内置预设
 
@@ -27,17 +27,52 @@
 
 详细契约、安全边界与生效方式见 [管理界面文档](<docs/management-ui.md>)。客户端半是仓库里的构建产物 `lib/client.js`，由 `src/client.js` 经 `pnpm run build` 生成；缺这个文件时宿主会报缺 bundle 并拒绝激活，所以改完客户端源码必须先构建。是否自动热替换取决于宿主的开发构建监听是否运行，页面打开不能说明新 bundle 已生效。**宿主**半改完需触发 profile 热重组以重新 import 模块；未生效或宿主不支持热重组时再重启 Harness。
 
-## 自动重连（Auto reconnect）
+## 连接由原生桥接监督
 
-- 仅监督**本插件挂载**、当前仍被选中（`selected`）、且策略仍允许自动连接（`autoAllowed`）的服务器。原生桥接按**能力**准入：`0.2.0-rc.2` / `0.2.1-rc.2` 这两个读过生命周期措辞的版本按版本信任，其余版本只要仍接受 `reconnect` 配置并导出 `createMcpToolDefinition` 就启用（日志写明“版本未核实、能力已确认”），凑不齐才回退原生行为。手动选择（`custom`）不妨碍符合策略的服务器重连；未被策略允许的手动连接只有单次尝试。手动断开 / 停止连接保持粘性。
-- 瞬时启动或断线故障按 **1、2、4、8、16、30、60 秒 × 0.8～1 随机抖动**重试，之后无限按 60 秒档重试；连接持续稳定 **30 秒**后才重置退避。模型请求不会绕过等待；一台恢复、切换或正常声明更新不会重启未变化的健康同伴。
-- 已选 `required` 服务器不可用期间拒绝模型请求，恢复后放行，但保留健康同伴。后台重试发现目标声明变化时以 `DECLARATION_CHANGED` 停止，等待下一次安全的模型组装 / 编辑协调应用新声明。
-- 面板用琥珀色 `reconnecting`、本地倒计时和尝试次数显示退避，提供「停止连接 / 立即重试」。非法声明、鉴权错误或永久性启动错误暂停；无法确认旧进程已关闭（`CLOSE_UNCONFIRMED`）时，连手动重试也禁止，须换会话或重启宿主。原生版本 / 接口无法验证时明确显示监控不支持，回退原生连接而不启用增强重连。
-- **断线感知**：对已连接的 HTTP 服务器做只读可达性探测（`HEAD`，1.5 秒超时，不带凭据，任何 HTTP 响应都算存活）。第一次失败立即撤下绿点、显示「待确认」，1.2 秒后复核；连续两次失败才交给重连监督器，而任何真实调用成功都会刷新确认。节奏随活跃度：有 MCP 活动时 10 秒，2 分钟后 30 秒，5 分钟无活动即停。面板打开时与工具调用前（距上次确认超过 5 秒）会即时探测，不可达时该次调用立刻得到明确原因，而不是干等工具超时；原调用不会重放。`stdio` 依赖子进程退出事件，不做探测。
-- 不重放失败工具、不替 UnityEditor 启动服务器。HTTP 会话 404 经有类型的调用错误识别后，按退避重新初始化会话，而不重放该调用。
+DSH 0.2.3 的 `@deepseek-ai/dsh-mcp-client` 通过 `ctx.mcpClientHost` 提供挂载、探测与授权，并自己维护连接状态机（`connecting` / `connected` / `reconnecting` / `failed` / `waiting-authorization` / `waiting-credentials` / `closed`）。本插件不再自建重试定时器，也不再按版本号或内部导出名探测能力：**连接、退避与尝试预算都由桥接执行**，插件只做三件事——把状态翻译成面板语言、在权限被撤销时结束实例、把「声明改坏了」的错误按字段报给用户。
 
-更多边界见[管理界面的自动重连说明](<docs/management-ui.md#auto-reconnect>)。0.3.1 的针对性验证及用户重新启用后的运行确认见上方兼容修复说明；这不代表已对所有自动重连与 GUI 场景完成现场验证。
+- **只监督本插件挂载的服务器**：挂载经 `ctx.mcpClientHost.mount()`，实例运行在本会话自己的作用域边界下，工具随实例注册与注销。
+- **重连状态来自桥接**：面板显示 `重连中 · 剩余秒数`（桥接给出的 `attempt` / `maxAttempts` / `nextRetryAtMs`）、`连接失败`（`gave-up` / `reconnect-disabled`）以及失败原因文本；插件不再有「无限 60 秒重试」的自建策略。
+- **静默失联**：桥接只能在传输层报告断开时才知道断线。对 HTTP 服务器，插件仍做**只读可达性探测**（`HEAD`，1.5 秒超时，不带凭据，任何 HTTP 响应都算存活）：第一次失败立即撤下绿点显示「待确认」，1.2 秒后复核；连续两次失败会**替换这个连接代**（dispose 后重新 mount），因为桥接无法报告一个不回应任何请求的端点。节奏随活跃度：有 MCP 活动时 10 秒，2 分钟后 30 秒，5 分钟无活动即停。面板打开时与工具调用前（距上次确认超过 5 秒）会即时探测，不可达时该次调用立刻得到明确原因，而不是干等工具超时；原调用不会重放。`stdio` 依赖子进程退出事件，不做探测。
+- **桥接看不见的失效**：会话在服务端被销毁（重启后旧 `Mcp-Session-Id` 失效）而端点仍然可达时，HTTP 传输不会收到 close，桥接会保持「已连接」。此时工具调用会失败一次且**不重放**；在面板里「断开」再「连接」（或改声明）会让它重新 initialize。这是有意的取舍：插件不按错误文本猜断线。
+- **连接清理结果可信**：实例的 `dispose()` 返回 `closeConfirmed` / `cleanupError`；无法确认关闭时该名字被标记为不可再启动（`CLOSE_UNCONFIRMED`），直到宿主重启，避免旧进程与新进程重叠。
+- **权限撤销即时生效**：保存配置导致某个自动连接的服务器不再被允许时，它的实例被结束，而不是继续按桥接的退避重试。
 
+更多边界见[管理界面的连接状态说明](<docs/management-ui.md#connection-states>)。
+
+## 工具加载：按需还是全量
+
+`toolLoading` 决定服务器的工具如何进入模型上下文，默认 **`on-demand`**：0.2.3 的桥接把工具列进系统提示词目录，只注册一个 `mcp__<server>__load_tools`，模型需要时按目录名加载。一个工作区声明多台服务器时，这能省掉绝大部分工具 schema。
+
+| 取值 | 行为 | 适合 |
+|---|---|---|
+| `on-demand`（默认） | 目录 + 按需加载；`catalogDescriptionMaxLength`（默认 160）限制每行简介长度 | 多服务器、工具多、上下文紧张 |
+| `eager` | 启动即全量注册，与旧版本一致 | 单台服务器、希望模型直接看到工具 |
+
+- 插件配置 `toolLoading` / `catalogDescriptionMaxLength` 是默认值；**单个声明可以覆盖**：`.mcp.json` 里给该服务器写 `toolLoading` / `catalogDescriptionMaxLength` 即可（不是任何方言的标准字段，只影响本插件）。
+- 面板把按需行标成「N 个工具（按需）」，展开说明这些工具不占工具位、由模型按需加载。
+- 按需加载不影响本插件的工具闸门与项目过滤：被加载出来的工具仍按 `mcp__<server>__<tool>` 判定，`includeTools`/`excludeTools` 仍然生效。唯一的例外是**加载器本身**——`mcp__<server>__load_tools` 是这套过滤的传输手段而不是其中一个工具，项目写了 `includeTools` 也不会把它禁掉（否则该服务器的工具永远无法加载）。被项目排除的工具仍会出现在目录里，可以加载，但调用时由 guard 拒绝。
+
+## 浏览器授权（OAuth）
+
+Streamable HTTP 服务器可以用 MCP OAuth 授权，令牌保存在宿主凭据服务里并自动刷新（不再只能手写 `headers`）。声明里加 `oauth`：
+
+```jsonc
+{
+  "mcpServers": {
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "oauth": { "scope": "read" }   // true 或省略字段都用动态客户端注册
+    }
+  }
+}
+```
+
+- 支持的字段：`clientId`、`scope`、`credentialKey`、`requestTimeoutMs`、`authorizationTimeoutMs`。不写 `credentialKey` 时按服务器名与端点派生（`mcp-client/workspace-mcp/<server>-<url 摘要>`），端点变了就要重新授权。
+- 被动连接**不会**自己打开浏览器：需要授权时该行显示「需要授权」并给出原因（`missing` / `expired` / `binding` / `rejected` / `scope`），点「授权」后走 DSH 的授权流程（`ctx.authorization` + `webServer` 回调页），面板给出授权页链接；完成后凭据更新会触发重连。
+- `oauth` 不能与 `Authorization` 头（含 `bearer_token_env_var`）同时声明，stdio 服务器也不能声明 `oauth`——这两种都会以 `INVALID_OAUTH` / `CONFLICTING_AUTH_HEADERS` 拒绝该条目，而不是静默降级。
+- 面板与 CLI 都能发起与取消授权：`POST /workspace-mcp/authorize`、`POST /workspace-mcp/cancelAuthorize`。
 ## 安装
 
 三种方式，任选其一。三条路都只把包装进 profile 的 `node_modules`，随后由 `dsh.bundle.patch` 插入 `workspace-mcp-glue` 条目，在插件页确认 `dsh-mcp-glue` 已启用即可。
@@ -59,7 +94,7 @@
 
 本包的**运行时代码刻意不 import** 任何 `@deepseek-ai/dsh-*` 模块：作用域身份来自模块私有 Symbol，第二份模块拷贝会让 scoped 注册退化成全局注册。原生 MCP 桥接通过宿主 Cordis loader 按运行时自己的实例加载（详见[调查笔记](<docs/loading-model.md#6-模块实例身份第三方插件的关键约束>)）。
 
-`peerDependencies` 只声明 `@deepseek-ai/dsh: >=0.2.0-rc.2` 并标为 `optional`。DSH 用它做安装与启动时的版本兼容判定（只认 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` 前缀），不满足就拒绝安装或告警；标 optional 后 pnpm 不会自动安装它，它也不代表运行时 import。`engines.dsh` 在 DSH 0.2.1+ 会被真实校验，0.2.0 的兼容判定则由上述 peer 声明覆盖。
+版本要求写在 `engines.dsh: >=0.2.3-alpha.2`。DSH 会真实校验它：不满足就禁用这个插件、拒绝安装（`engines.dsh` 存在时 `peerDependencies` 被忽略），所以这里**刻意不再声明 `@deepseek-ai/dsh` peer**——它是 0.2.3 才有的 `ctx.mcpClientHost` 契约，声明成 peer 只会把整个 `@deepseek-ai/dsh` 元包拉进本包的开发依赖。
 
 开发/打包（`node`/`pnpm` 应为 Node 22.16+）：
 
@@ -122,9 +157,9 @@ pnpm pack
 - 用户取消、超时或回答失败时按**拒绝**处理（fail closed），错误里带上原因。
 - 闸门**只拦本插件挂载的服务器**：全局 MCP 和其他插件挂的 MCP 一律不碰。
 - DSH 侧的事件契约、`exec` 字段、决策四态、与 `tools.guard` 的关系，以及判断完全权限的正确姿势，见[闸门契约](<docs/gate-contract.md>)。
-- **项目自己的工具过滤优先于这里的任何开关**：`includeTools` / `excludeTools`（Codex `enabled_tools` / `disabled_tools`、Gemini）由 `tools.guard` 在本闸门**之后**执行，而 guard 只能拒绝、没有任何东西能把它翻回允许。所以一个被项目禁用的工具**既不会被询问、也不会被面板放行**：闸门直接跳过它，交给 guard 用准确的理由拒绝；面板把那一行标成「项目已禁用」并且不给开关——避免出现永远不生效的开关。
+- **项目自己的工具过滤优先于这里的任何开关**：`includeTools` / `excludeTools`（Codex `enabled_tools` / `disabled_tools`、Gemini）由 `tools.guard` 在本闸门**之后**执行，而 guard 只能拒绝、没有任何东西能把它翻回允许。所以一个被项目禁用的工具**既不会被询问、也不会被面板放行**：闸门直接跳过它，交给 guard 用准确的理由拒绝；面板把那一行标成「项目已禁用」并且不给开关——避免出现永远不生效的开关。按需加载的 `mcp__<server>__load_tools` 不在过滤范围里：它是过滤的传输手段，禁掉它就等于禁掉整台服务器。
 - 不读取其他客户端的自动信任、OAuth、用户全局设置；项目不能声明自己受信任。
-- 项目内容里影响鉴权/隔离的字段（OAuth、动态 headers helper、remote stdio、服务器级 sandbox 等）会导致该服务器被跳过而不是静默降级；原生启动错误只记录脱敏摘要，不把展开后的密钥写进插件日志。
+- `oauth` 是**受支持**的鉴权方式（见上节）；其余影响鉴权/隔离的字段（动态 headers helper、`authProviderType`、remote stdio、服务器级 sandbox 等）会导致该服务器被跳过而不是静默降级。桥接自己保留脱敏后的诊断文本，本插件只记录有界错误码，不把展开后的密钥写进日志。
 
 ### 编辑配置（写声明文件）
 
@@ -155,11 +190,11 @@ MCP 小面板标题栏提供 **＋新建 / 管理**；**点服务器名称即可
 - 以 `agent.session.header.cwd` 为唯一工作区根；不使用 DSH Host 的当前目录，不向父目录寻找项目根，不读取用户全局 MCP 配置。
 - 同一个服务器名可以分别出现在工作区 A/B，它们的进程、工具、资源、指令彼此隔离；同一工作区的不同会话也各自连接，不共享可变进程。
 - 原有全局 MCP 仍对会话可见；同名的项目工具按 DSH scoped-shadow 规则覆盖对应的全局工具。插件不删除全局 MCP。
-- 每次模型请求组装时重新读取声明；新增、修改、删除在**下一次模型请求**生效，不在运行中的工具调用中途切换。
+- 每次**工具准入**（`ctx.tools.resolve`，模型请求组装前）重新读取声明；新增、修改、删除在**下一次模型请求**生效，不在运行中的工具调用中途切换。
 - 正常更新重新按策略（目录信任 / 白名单）判定，并逐服务器比较 spec / 来源：只卸载删除、改动或取消选择的条目，新增 / 改动的条目独立加载；未变化的健康连接与子 fiber 保留。
 - 已运行的会话在安装/热加载插件后于下次请求安全加载。插件卸载或 Agent 释放会关闭其连接、删除 scoped 工具、资源和指令。
 - 语法错误/不支持的服务器会记录有界诊断并跳过，不影响其他有效服务器；删掉声明后不会保留旧服务器。Codex `required: true` 的服务器**声明本身非法、启动失败或运行中断线**会拒绝模型请求而不是静默降级；运行时故障由符合资格的监督重试恢复，模型请求不绕过退避，健康同伴保留。至于「没被授权且未选中」——那只是没加载，不是错误：插件不会为一个用户的沉默而打断会话。
-- 加载发生在 `system-prompt/assemble` 的组装阶段，因此新增/删除的服务器能在**当前**这次请求就生效，而不是等到下一轮。
+- 加载发生在该步的工具准入处，因此新增/删除的服务器能在**当前**这次请求就生效，而不是等到下一轮。
 - 工具白名单/黑名单由本插件注册的 guard 在调用前判定：只有该项目作用域注册的工具会被限制，全局 MCP 即使名称前缀相同也不受影响；被禁工具仍可能出现在 schema 列表中，但直接调用与 PTC 调用都会被拒绝。
 
 ## 自定义预设
@@ -225,7 +260,7 @@ integrations:
 - 默认 `conflictPolicy: error` 禁用不同来源中存在不同配置的同名服务器；完全相同的声明去重。可显式选择 `first-wins`/`last-wins`，整条替换、不混合凭证。
 - 本插件支持 DSH 原生 **stdio / Streamable HTTP**；`type: http` 映射到 Streamable HTTP。未指定 type 时根据 command/url 推断，是兼容加载器策略而非 Claude 的严格校验行为。
 - Gemini `httpUrl` 是 HTTP，`url` 是旧 SSE，**不会误当 HTTP**。
-- SSE、WebSocket、OAuth、动态 headers helper、remote stdio、显式服务器 sandbox 策略暂不支持；带这些影响安全/鉴权的声明会跳过，而不是静默降级。
+- SSE、WebSocket、动态 headers helper、remote stdio、显式服务器 sandbox 策略暂不支持；带这些影响安全/鉴权的声明会跳过，而不是静默降级。（`oauth` 已支持，见「浏览器授权」。）
 - 支持 Codex `enabled_tools`/`disabled_tools` 与 Gemini `includeTools`/`excludeTools` 的**调用限制**（排除优先）；被禁工具可能仍在 schema 列表中，但直接调用/PTC 调用均会被 guard 阻止。Gemini `trust` 不会自动批准工具。
 - 不支持 VS Code `env` 中 null 删除继承变量；非字符串/数字环境值拒绝。不会导入其他客户端的单工具批准/输出截断策略。
 - 非原生安全服务器名会确定性规范化并附 hash；包含 `__` 或以 `_` 结尾的名字也会 hash，避免原生未转义分隔符造成工具身份/过滤前缀重叠。

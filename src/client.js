@@ -251,6 +251,32 @@ const DICT = {
   "settings.trustedWorkspacesLabel": ["受信任的工作区（每行一个绝对路径；精确匹配该目录本身，不含子目录）", "Trusted workspaces (one absolute path per line; matches that directory itself, not its subdirectories)"],
   "settings.trustHint": ["受信任的工作区在会话创建时直接加载声明；其余工作区里的声明不会被加载，也不会弹窗询问——要放行就在对话里的 MCP 面板逐台打开「自动连接」，或者把它的目录加进下面的列表。两者都可热改：保存后立即生效，不需要重启。", "Trusted workspaces load their declarations as soon as the session is created; declarations in other workspaces are never loaded and never prompt — to allow one, turn on auto-connect per server in the conversation's MCP panel, or add its directory to the list below. Both are hot-editable: they apply immediately after saving, with no restart."],
   "state.connected": ["已连接", "Connected"],
+  "state.authorization": ["需要授权", "Authorization needed"],
+  "authorization.phase.starting": ["正在准备授权…", "Preparing authorization…"],
+  "authorization.phase.waiting-browser": ["等待浏览器授权…", "Waiting for the browser…"],
+  "authorization.phase.exchanging": ["正在换取令牌…", "Exchanging the code…"],
+  "authorization.phase.committing": ["正在保存授权…", "Saving the grant…"],
+  "authorization.phase.authorized": ["授权完成", "Authorized"],
+  "authorization.phase.cancelled": ["授权已取消", "Authorization cancelled"],
+  "authorization.phase.failed": ["授权失败", "Authorization failed"],
+  "authorization.reason.missing": ["还没有保存过授权", "No grant is stored yet"],
+  "authorization.reason.expired": ["保存的令牌已过期且无法刷新", "The stored token expired and cannot be refreshed"],
+  "authorization.reason.binding": ["保存的授权与当前端点或客户端不再匹配", "The stored grant no longer matches this endpoint or client"],
+  "authorization.reason.rejected": ["服务器或授权服务器拒绝了令牌", "The server or authorization server rejected the token"],
+  "authorization.reason.scope": ["服务器要求的权限范围超出已保存的授权", "The server requires a scope the stored grant lacks"],
+  "action.authorize": ["授权", "Authorize"],
+  "action.authorizeOpen": ["打开授权页", "Open authorization page"],
+  "action.cancelAuthorize": ["取消授权", "Cancel authorization"],
+  "reason.AUTHORIZATION_REQUIRED": ["需要浏览器授权：点「授权」打开授权页", "Browser authorization required: choose Authorize to open the page"],
+  "reason.RECONNECT_GAVE_UP": ["自动重连次数已用尽，点「重试」重新连接", "Automatic reconnection gave up; choose Retry to connect again"],
+  "reason.RECONNECT_DISABLED": ["连接已断开且自动重连已关闭", "The connection dropped and automatic reconnection is off"],
+  "reason.MISSING_CREDENTIALS": ["声明里的凭据变量还没有值", "A credential variable in the declaration has no value yet"],
+  "reason.NATIVE_UNAVAILABLE": ["当前 Host 不提供 MCP 客户端宿主（ctx.mcpClientHost），无法连接", "This Host does not publish the MCP client host (ctx.mcpClientHost)"],
+  "reason.INVALID_CONFIG": ["宿主拒绝了这个服务器声明，见下方提示", "The Host refused this declaration; see the hint below"],
+  "reason.OAUTH_UNSUPPORTED": ["这个服务器没有声明浏览器授权（oauth）", "This server is not declared for browser authorization (oauth)"],
+  "row.toolsOnDemand": ["{count} 个工具（按需）", "{count} tools (on demand)"],
+  "row.onDemandHint": ["这些工具不占工具位：它们列在系统提示词里，模型用一个加载工具按需取用。", "These tools take no tool slots: the prompt lists them and the model loads what it needs."],
+  "row.oauthTarget": ["浏览器授权", "Browser authorization"],
   "state.failed": ["连接失败", "Connection failed"],
   "state.invalid": ["声明有问题", "Declaration problem"],
   "state.pending": ["连接中", "Connecting"],
@@ -271,7 +297,7 @@ const DICT = {
   "action.retryNow": ["立即重试", "Retry now"],
   "action.retryShort": ["重试", "Retry"],
   "action.stopShort": ["停止", "Stop"],
-  "panel.monitorUnsupported": ["当前原生桥接版本无法验证，增强重连与断线监控不可用。", "This native bridge version cannot be verified; enhanced reconnect and disconnect monitoring are unavailable."],
+  "panel.monitorUnsupported": ["当前 Host 不提供 ctx.mcpClientHost，工作区 MCP 无法连接或探测。", "This Host does not publish ctx.mcpClientHost; workspace MCP cannot connect or probe."],
   "reason.CLOSE_UNCONFIRMED": ["无法确认旧连接已关闭，请重建会话或重启 DSH", "The old connection could not be confirmed closed; recreate this session or restart DSH"],
   "reason.AUTH_REQUIRED": ["认证被拒绝，请检查凭证后立即重试", "Authentication was rejected; check credentials, then retry"],
   "reason.DECLARATION_CHANGED": ["声明已改变，将在下一次模型请求或编辑保存后应用", "The declaration changed; it will apply at the next model request or editor save"],
@@ -629,6 +655,7 @@ async function request(path, body, signal) {
 }
 
 const STATE_LABEL = {
+  authorization: t('state.authorization'),
   connected: t('state.connected'),
   failed: t('state.failed'),
   invalid: t('state.invalid'),
@@ -646,7 +673,8 @@ function dotElement(state, key) {
 /** Failures the user can act on, and therefore the only ones worth a line of their own. */
 const ACTIONABLE_REASONS = new Set([
   'CLOSE_UNCONFIRMED', 'AUTH_REQUIRED', 'DECLARATION_CHANGED', 'ENOENT', 'EACCES', 'EPERM',
-  'AUTO_CONNECT_REVOKED', 'STARTUP_TIMEOUT',
+  'AUTO_CONNECT_REVOKED', 'STARTUP_TIMEOUT', 'AUTHORIZATION_REQUIRED', 'RECONNECT_GAVE_UP',
+  'RECONNECT_DISABLED', 'MISSING_CREDENTIALS', 'NATIVE_UNAVAILABLE', 'INVALID_CONFIG', 'OAUTH_UNSUPPORTED',
 ]);
 /** Localised guidance when we have it, else the bounded transport code itself. */
 const reasonText = error => (ACTIONABLE_REASONS.has(error) ? t(`reason.${error}`) : error);
@@ -654,7 +682,7 @@ const reasonText = error => (ACTIONABLE_REASONS.has(error) ? t(`reason.${error}`
 /** Panel row states that force the chip red: a broken declaration or a failed start. */
 const CHIP_ERROR_STATES = new Set(['failed', 'invalid']);
 /** Panel row states that force the chip amber: declared, but not connected. */
-const CHIP_WARN_STATES = new Set(['unauthorized', 'unloaded', 'reconnecting']);
+const CHIP_WARN_STATES = new Set(['authorization', 'unauthorized', 'unloaded', 'reconnecting']);
 
 /**
  * Chip text, dot state and accessible name for one host status payload.
@@ -1454,6 +1482,15 @@ function ServerRow(props) {
   const connecting = row.state === 'pending' || row.state === 'reconnecting';
   const canStop = connecting && (busy === undefined || busy === `connect:${row.id}` || busy === 'connect:');
   const waiting = row.state === 'reconnecting' && Number.isFinite(row.reconnect?.nextRetryAt);
+  // Browser authorization is its own decision, not a connect: the row asks for the grant first,
+  // and the live mount reconnects by itself once the Host stores it.
+  const authorizing = row.state === 'authorization';
+  const attempt = row.authorization;
+  const attemptPhase = typeof attempt?.phase === 'string' ? attempt.phase : undefined;
+  const attemptActive = attemptPhase !== undefined
+    && ['starting', 'waiting-browser', 'exchanging', 'committing'].includes(attemptPhase);
+  const authorizationUrl = typeof attempt?.authorizationUrl === 'string' && /^https?:\/\//i.test(attempt.authorizationUrl)
+    ? attempt.authorizationUrl : undefined;
   const rowChildren = [
     dotElement(unverified ? 'stale' : row.state, 'dot'),
     React.createElement(onEdit === undefined ? 'span' : 'button', {
@@ -1472,7 +1509,9 @@ function ServerRow(props) {
       : React.createElement('span', {
         key: 'tag', className: 'wmcp-tag',
         title: unverified ? row.error ?? t('state.stale') : row.error === undefined ? undefined : reasonText(row.error),
-      }, unverified ? t('state.stale') : STATE_LABEL[row.state] ?? row.state),
+      }, unverified ? t('state.stale')
+        : authorizing && attemptPhase !== undefined ? t(`authorization.phase.${attemptPhase}`)
+          : STATE_LABEL[row.state] ?? row.state),
     showPolicy ? React.createElement(Switch, {
       key: 'allow',
       checked: allowed,
@@ -1496,7 +1535,10 @@ function ServerRow(props) {
       title: expanded ? t('row.toolsCollapse') : t('row.toolsExpand'),
       onClick: () => onToggleExpand(row.id),
     }, [
-      React.createElement('span', { key: 'label' }, t('row.toolsCount', { count: tools.length })),
+      React.createElement('span', { key: 'label' }, row.loading === 'on-demand'
+        // An on-demand server publishes one loader tool, so the catalog size is the useful count.
+        ? t('row.toolsOnDemand', { count: row.offeredTools ?? tools.length })
+        : t('row.toolsCount', { count: tools.length })),
       React.createElement('span', { key: 'arrow', className: 'wmcp-tools-arrow', 'aria-hidden': true }, expanded ? '▴' : '▾'),
     ]),
     onProbe === undefined ? null : actionButton({
@@ -1509,9 +1551,14 @@ function ServerRow(props) {
     actionButton({
       key: 'act',
       disabled: (!canStop && busy !== undefined) || row.state === 'invalid' || row.error === 'CLOSE_UNCONFIRMED',
-      title: row.state === 'invalid' ? t('row.unconvertible') : undefined,
-      onClick: () => onAct(connected || connecting ? 'disconnect' : 'connect'),
-    }, busy !== undefined && !canStop ? '…' : connected ? t('action.disconnect') : connecting ? t('action.stopShort') : row.state === 'failed' ? t('action.retryShort') : t('action.connect')),
+      title: row.state === 'invalid' ? t('row.unconvertible') : authorizing ? t('reason.AUTHORIZATION_REQUIRED') : undefined,
+      onClick: () => onAct(authorizing ? 'authorize' : connected || connecting ? 'disconnect' : 'connect'),
+    }, busy !== undefined && !canStop ? '…' : authorizing ? t('action.authorize') : connected ? t('action.disconnect') : connecting ? t('action.stopShort') : row.state === 'failed' ? t('action.retryShort') : t('action.connect')),
+    attemptActive ? actionButton({
+      key: 'cancel-authorization', disabled: busy !== undefined,
+      title: t('action.cancelAuthorize'), 'aria-label': t('action.cancelAuthorize'),
+      onClick: () => onAct('cancelAuthorize'),
+    }, t('action.cancelAuthorize')) : null,
     // A scheduled retry is the only secondary action, and it fits next to the primary one
     // now that the row carries no menu entry.
     connecting ? actionButton({
@@ -1524,36 +1571,59 @@ function ServerRow(props) {
   // Only an actionable reason earns a line of its own; a transport code stays in the tag's
   // tooltip so a troubled row keeps the same single-line shape as a healthy one.
   if (row.error !== undefined && ACTIONABLE_REASONS.has(row.error)) {
-    children.push(React.createElement('span', { key: 'reason', className: 'wmcp-tools-hint' }, reasonText(row.error)));
+    // The bounded reason plus, when the bridge said why, its own redacted diagnostic.
+    const detail = typeof row.detail === 'string' && row.detail.length > 0 ? ` — ${row.detail}` : '';
+    children.push(React.createElement('span', { key: 'reason', className: 'wmcp-tools-hint' }, `${reasonText(row.error)}${detail}`));
+  }
+  if (authorizing || attemptActive) {
+    // Why the stored grant cannot be used, or how far the attempt has come. An unknown reason
+    // code falls back to nothing rather than printing an untranslated key.
+    const reasonKey = typeof attempt?.reason === 'string' ? `authorization.reason.${attempt.reason}` : undefined;
+    const reason = reasonKey !== undefined && DICT[reasonKey] !== undefined ? t(reasonKey) : undefined;
+    const text = [reason, typeof attempt?.lastError === 'string' ? attempt.lastError : undefined]
+      .filter(value => typeof value === 'string' && value.length > 0).join(' · ');
+    if (text.length > 0) children.push(React.createElement('span', { key: 'authorization', className: 'wmcp-tools-hint' }, text));
+    if (authorizationUrl !== undefined) {
+      children.push(React.createElement('a', {
+        key: 'authorization-url', className: 'wmcp-tools-hint',
+        href: authorizationUrl, target: '_blank', rel: 'noopener noreferrer',
+      }, t('action.authorizeOpen')));
+    }
   }
   if (probe !== undefined && (probe.result !== undefined || probe.error !== undefined || probe.busy === true)) {
     children.push(React.createElement('span', { key: 'probe', className: 'wmcp-tools-hint', 'data-kind': probe.error !== undefined || probe.result?.ok === false ? 'error' : undefined }, probeText(probe)));
   }
   if (expanded) {
-    children.push(React.createElement('div', { key: 'tools', className: 'wmcp-tools' },
-      tools.length === 0
-        ? [React.createElement('p', { key: 'hint', className: 'wmcp-tools-hint' }, t('row.toolsAfterConnect'))]
-        : tools.map(tool => {
-          // The project's own include/exclude list wins over anything the user allows here: a
-          // guard denies those calls after this gate, so the row reports the prohibition instead
-          // of offering a switch that could never take effect.
-          const forbidden = (row.disabledTools ?? []).includes(tool);
-          return React.createElement('div', { key: tool, className: forbidden ? 'wmcp-tool is-forbidden' : 'wmcp-tool' }, [
-            React.createElement('span', { key: 'name', className: 'wmcp-tool-name', title: tool }, tool),
-            forbidden
-              ? React.createElement('span', { key: 'declared', className: 'wmcp-tool-declared', title: t('row.projectDisabledHint') }, t('row.projectDisabled'))
-              : React.createElement(Switch, {
-                key: 'switch',
-                checked: (allowance?.allowTools ?? []).includes(tool),
-                disabled: busy !== undefined || !writable,
-                ariaLabel: t('tool.exemptAria', { tool: tool }),
-                hint: (allowance?.allowTools ?? []).includes(tool)
-                  ? t('tool.exemptOff', { tool: tool })
-                  : t('tool.exemptOn', { tool: tool }),
-                onToggle: () => onToggleTool(tool),
-              }),
-          ]);
-        })));
+    const toolChildren = [];
+    // One loader tool is registered for an on-demand server; the rest of its catalog lives in
+    // the prompt, so say so instead of letting an almost-empty list look like a broken server.
+    if (row.loading === 'on-demand') toolChildren.push(React.createElement('p', { key: 'ondemand', className: 'wmcp-tools-hint' }, t('row.onDemandHint')));
+    if (tools.length === 0) {
+      if (row.loading !== 'on-demand') toolChildren.push(React.createElement('p', { key: 'hint', className: 'wmcp-tools-hint' }, t('row.toolsAfterConnect')));
+    } else {
+      toolChildren.push(...tools.map(tool => {
+        // The project's own include/exclude list wins over anything the user allows here: a
+        // guard denies those calls after this gate, so the row reports the prohibition instead
+        // of offering a switch that could never take effect.
+        const forbidden = (row.disabledTools ?? []).includes(tool);
+        return React.createElement('div', { key: tool, className: forbidden ? 'wmcp-tool is-forbidden' : 'wmcp-tool' }, [
+          React.createElement('span', { key: 'name', className: 'wmcp-tool-name', title: tool }, tool),
+          forbidden
+            ? React.createElement('span', { key: 'declared', className: 'wmcp-tool-declared', title: t('row.projectDisabledHint') }, t('row.projectDisabled'))
+            : React.createElement(Switch, {
+              key: 'switch',
+              checked: (allowance?.allowTools ?? []).includes(tool),
+              disabled: busy !== undefined || !writable,
+              ariaLabel: t('tool.exemptAria', { tool: tool }),
+              hint: (allowance?.allowTools ?? []).includes(tool)
+                ? t('tool.exemptOff', { tool: tool })
+                : t('tool.exemptOn', { tool: tool }),
+              onToggle: () => onToggleTool(tool),
+            }),
+        ]);
+      }));
+    }
+    children.push(React.createElement('div', { key: 'tools', className: 'wmcp-tools' }, toolChildren));
   }
   return React.createElement('div', { className: 'wmcp-item' }, children);
 }

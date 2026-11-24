@@ -45,6 +45,22 @@ export function createControl(ctx, stateFor) {
       if (typeof serverId !== 'string' || !serverId) throw new Error('workspace-mcp: a server id is required');
       return resolve(id).probe(serverId);
     },
+    /**
+     * Start (or resume) browser authorization for one declared OAuth server.
+     *
+     * The answer is the fresh status view, which carries the attempt phase and, while one is
+     * waiting for the browser, the page to open. The grant itself lands in the Host's credential
+     * store and the live mount reconnects on its own.
+     */
+    async authorize(id, serverId) {
+      if (typeof serverId !== 'string' || !serverId) throw new Error('workspace-mcp: a server id is required');
+      return resolve(id).authorize(serverId);
+    },
+    /** Cancel the active authorization attempt of one server; a stored grant is kept. */
+    async cancelAuthorization(id, serverId) {
+      if (typeof serverId !== 'string' || !serverId) throw new Error('workspace-mcp: a server id is required');
+      return resolve(id).cancelAuthorization(serverId);
+    },
     /** The declaration files behind one session, plus whether that session may write them. */
     async declarations(id) {
       return resolve(id).declarationTargets(undefined);

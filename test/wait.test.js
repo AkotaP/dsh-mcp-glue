@@ -91,7 +91,11 @@ test('the control facade forwards a one-shot probe and refuses an undeclared ser
   assert.equal(calls.length, 1);
   assert.equal(calls[0].config.serverName, 'demo');
   assert.equal(calls[0].options.timeoutMs, 10000);
-  assert.equal(calls[0].ownerCtx, state.scopeOwner, 'the host is created below the session owner context');
+  // The host lives below this session's own scope boundary, so the instances it mounts register
+  // tools in this agent's scope and end with the session. It also isolates the service name, so
+  // two sessions never fight over one provider slot.
+  assert.equal(typeof calls[0].ownerCtx?.get, 'function', 'the host is created below the session boundary');
+  assert.equal(calls[0].ownerCtx === state.group.ctx, false);
   await assert.rejects(control.probe('wait-agent', 'missing'), failure => failure.code === 'UNKNOWN_SERVER');
   await assert.rejects(control.probe('wait-agent', undefined), /server id/);
 });

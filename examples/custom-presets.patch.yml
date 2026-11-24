@@ -27,6 +27,11 @@
     maxServers: 32
     startupTimeoutMs: 15000
 
+    # 工具注入方式：on-demand 只注册 mcp__<server>__load_tools，工具名进提示词目录（默认）
+    # 改成 eager 则启动即全量注册；单条声明可覆盖这两个值
+    toolLoading: on-demand
+    catalogDescriptionMaxLength: 160
+
     presets:
       # 团队自有 YAML 声明：任意位置 / 任意字段名（点路径或 JSON Pointer）
       - id: team-tools

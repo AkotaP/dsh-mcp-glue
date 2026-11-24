@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { HEALTH, probeHttp, probeTarget } from '../src/health.js';
-import { agent, harness, session } from './helpers.js';
+import { agent, fakeHost, harness, session } from './helpers.js';
 
 const signal = () => new AbortController().signal;
 
@@ -64,36 +64,41 @@ test('a probe treats any HTTP answer as alive and only network failures as gone'
   assert.equal(probeTarget({ config: { transport: 'streamable-http', url: 'file:///etc/passwd' } }), undefined);
 });
 
-/** One HTTP server mounted through a native bridge stub of the verified shape. */
+/** One HTTP server mounted through a fake host; only its reachability probes are real logic. */
 async function fixture(t) {
   const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'health-owner');
   const clock = fakeClock(), probe = { reachable: true, mcpOk: true }, logs = [];
-  const nativePlugin = { name: 'mcp-client', inject: ['tools'],
-    async probeServer() { return probe.mcpOk ? { ok: true, toolNames: ['identity'], durationMs: 3, closeConfirmed: true } : { ok: false, stage: 'connect', message: 'unreachable', closeConfirmed: true }; },
-    async apply(child, config) {
-    child.tools.register({
-      name: `mcp__${config.serverName}__identity`, description: 'health fixture',
-      parameters: { type: 'object', properties: {} }, execute: () => 'ok',
-      output: { schema: {}, render: () => [{ type: 'text', text: 'ok' }] },
-    });
-  } };
+  const host = fakeHost({
+    mount: record => {
+      record.context.tools.register({
+        name: `mcp__${record.config.serverName}__identity`, description: 'health fixture',
+        parameters: { type: 'object', properties: {} }, execute: () => 'ok',
+        output: { schema: {}, render: () => [{ type: 'text', text: 'ok' }] },
+      });
+      return {};
+    },
+    probe: () => (probe.mcpOk
+      ? { ok: true, toolNames: ['identity'], truncated: false, durationMs: 3, closeConfirmed: true }
+      : { ok: false, stage: 'connect', message: 'unreachable', durationMs: 1, closeConfirmed: true }),
+  });
   const entry = name => ({
     source: { preset: 'fixture', file: '.mcp.json', server: name },
     spec: { config: { serverName: name, transport: 'streamable-http', url: 'http://fixture.invalid/mcp' } },
   });
   const plan = { cwd: process.cwd(), fingerprint: 'health-generation', diagnostics: [], servers: [entry('wire')] };
   const state = session(ctx, owner, { trustMode: 'all' }, {
-    clock, nativePlugin,
+    clock,
+    nativePlugin: host.module,
     load: async () => plan,
     logger: Object.fromEntries(['warn', 'error', 'info', 'debug'].map(level => [level, text => logs.push(`${level}: ${text}`)])),
     fetchImpl: async () => { if (!probe.reachable) throw refusal(); return { body: { cancel() {} } }; },
   });
   t.after(() => state.dispose());
-  return { ctx, owner, state, clock, probe, plan };
+  return { ctx, owner, state, host, clock, probe, plan };
 }
 const rowOf = async state => (await state.status()).servers.find(row => row.id === 'wire');
 
-test('an unreachable HTTP server turns the row unconfirmed first and reconnects on confirmation', async t => {
+test('an unreachable HTTP server withdraws the green claim, then replaces the connection', async t => {
   const f = await fixture(t);
   await f.state.reconcile(signal());
   assert.equal((await rowOf(f.state)).verified, true, 'a fresh connection is its own confirmation');
@@ -104,36 +109,32 @@ test('an unreachable HTTP server turns the row unconfirmed first and reconnects 
   let row = await rowOf(f.state);
   assert.equal(row.state, 'connected', 'one failed probe must not tear down a possibly working connection');
   assert.equal(row.verified, false, 'but the green claim is withdrawn immediately');
+  assert.equal(f.host.calls.mounts.length, 1);
 
   f.clock.tick(HEALTH.confirmMs);
   await drain(f.state);
-  row = await rowOf(f.state);
-  assert.equal(row.state, 'reconnecting', 'the confirmation probe hands the server to the reconnect supervisor');
-  assert.equal(f.ctx.tools.get('mcp__wire__identity', f.owner), undefined, 'its tools are withdrawn while down');
-
-  f.probe.reachable = true;
-  f.clock.tick(60000);
-  await drain(f.state);
+  // The bridge cannot report a silent endpoint death, so the confirmation failure replaces the
+  // generation instead of waiting for a close event that will never come.
+  assert.equal(f.host.calls.mounts.length, 2);
+  assert.equal(f.host.calls.mounts[0].disposed, 1, 'the replaced generation is closed');
   row = await rowOf(f.state);
   assert.equal(row.state, 'connected');
-  assert.equal(row.verified, true, 'a recovered connection is confirmed again');
 });
 
-test('a working connection survives a blocked probe once real traffic answers', async t => {
+test('a failed probe that is confirmed again keeps the same connection', async t => {
   const f = await fixture(t);
   await f.state.reconcile(signal());
-  const tool = f.ctx.tools.get('mcp__wire__identity', f.owner);
   f.probe.reachable = false;
   f.clock.tick(HEALTH.hotMs);
   await drain(f.state);
   assert.equal((await rowOf(f.state)).verified, false);
 
-  // The bridge reports a real answer, which outranks a probe that a firewall may be eating.
-  assert.equal(typeof tool.execute, 'function');
-  await tool.execute({}, { agent: f.owner, signal: signal(), callId: 'health-call' });
+  f.probe.reachable = true;
+  f.clock.tick(HEALTH.confirmMs);
   await drain(f.state);
-  assert.equal(f.state.serverStates.get('wire').state, 'connected');
-  assert.equal(f.state.mounts.get('wire').probeFailures, 0, 'traffic clears the strike count');
+  const row = await rowOf(f.state);
+  assert.equal(row.verified, true, 'the confirmation probe restores the claim');
+  assert.equal(f.host.calls.mounts.length, 1, 'a reachable server is never reconnected');
 });
 
 test('stdio servers are never probed, and a pre-call check never waits on a fresh connection', async t => {
@@ -142,7 +143,7 @@ test('stdio servers are never probed, and a pre-call check never waits on a fres
     spec: { config: { serverName: 'wire', transport: 'stdio', command: 'node', args: [] } } }];
   await f.state.reconcile(signal());
   const record = f.state.mounts.get('wire');
-  assert.equal(record.probeTimer, undefined, 'a child process exit reaches us as an event; no probe is needed');
+  assert.equal(record.probeTimer, undefined, 'a child process exit reaches us as a status, so no probe is needed');
   assert.equal((await rowOf(f.state)).verified, true);
 
   const fresh = await f.state.verifyBeforeCall('wire', signal());
@@ -163,6 +164,7 @@ test('an on-demand probe settles the confidence it measured without tearing the 
   assert.equal((await f.state.probe('wire')).ok, true);
   assert.equal((await rowOf(f.state)).verified, true);
   assert.equal((await rowOf(f.state)).state, 'connected');
+  assert.equal(f.host.calls.mounts.length, 1);
 
   f.probe.mcpOk = false;
   f.probe.reachable = true;

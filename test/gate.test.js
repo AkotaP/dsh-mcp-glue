@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as Plugin from '../src/index.js';
-import { agent, fixtureCommand, harness, provideSettings, workspace, writeFixture } from './helpers.js';
+import { agent, callTool, fixtureCommand, harness, provideSettings, textOf, workspace, writeFixture } from './helpers.js';
 const signal = () => new AbortController().signal;
 
 /** Answerer stub: hands back the queued labels, or throws when the queue is empty. */
@@ -19,7 +19,7 @@ function provideQuestions(ctx, answers) {
   return asked;
 }
 
-const execute = (ctx, owner, name) => ctx.tools.execute({ name, arguments: {}, agent: owner, callId: `call-${name}`, signal: signal() });
+const execute = (ctx, owner, name) => callTool(ctx, owner, name, {}, { callId: `call-${name}` });
 const TOOL = 'mcp__same__identity';
 
 /** Mount one fixture server through the per-workspace allowance, leaving the tool itself ungated. */
@@ -33,11 +33,14 @@ async function gated(t, { answers = [], mode = 'workspace-write', config = {}, q
   const settings = provideSettings(ctx, { trustMode: 'manual', trustedWorkspaces: [], workspaceAllowances: [{ workspace: dir, allowMcp: ['same'], allowTools: [] }] });
   const merged = {
     trustMode: 'manual',
+    toolLoading: 'eager',
     workspaceAllowances: [{ workspace: dir, allowMcp: ['same'] }],
     ...config,
   };
   await ctx.plugin(Plugin, merged);
-  await ctx.systemPrompt.assemble({ agent: a, scope: a, signal: signal() });
+  // The step's tool admission is what mounts the workspace declarations before a call.
+  const admitted = await ctx.tools.resolve({ agent: a, scope: a, modelSelection: {}, signal: signal() });
+  t.after(() => admitted.dispose());
   return { ctx, dir, a, asked, settings };
 }
 
@@ -73,8 +76,9 @@ test('a tool the project itself forbids is never asked about', { timeout: 40000 
   const asked = provideQuestions(ctx, ['仅此次允许', '仅此次允许']);
   ctx.provide('sandboxPolicy', { resolve: () => ({ mode: 'workspace-write' }) });
   provideSettings(ctx, { trustMode: 'manual', trustedWorkspaces: [], workspaceAllowances: [{ workspace: dir, allowMcp: ['same'], allowTools: [] }] });
-  await ctx.plugin(Plugin, { trustMode: 'manual', workspaceAllowances: [{ workspace: dir, allowMcp: ['same'] }] });
-  await ctx.systemPrompt.assemble({ agent: a, scope: a, signal: signal() });
+  await ctx.plugin(Plugin, { trustMode: 'manual', toolLoading: 'eager', workspaceAllowances: [{ workspace: dir, allowMcp: ['same'] }] });
+  const admitted = await ctx.tools.resolve({ agent: a, scope: a, modelSelection: {}, signal: signal() });
+  t.after(() => admitted.dispose());
 
   // The tool the declaration still enables asks as usual.
   assert.equal((await execute(ctx, a, 'mcp__same__identity')).isError, false);
@@ -108,7 +112,7 @@ test('an answer that never arrives refuses the call instead of wedging it', { ti
 });
 
 test('nothing asks when the policy already allowed it, when the deployment is unconfined, or when no answerer is composed', { timeout: 40000 }, async t => {
-  const trusted = await gated(t, { config: { trustMode: 'all' } });
+  const trusted = await gated(t, { config: { trustMode: 'all', toolLoading: 'eager' } });
   const allowed = await execute(trusted.ctx, trusted.a, TOOL);
   assert.equal(allowed.isError, false, `trustMode: all must leave the tool callable: ${JSON.stringify(allowed.error ?? allowed)}`);
   assert.equal(trusted.asked.length, 0, 'trustMode: all never asks');
@@ -126,4 +130,23 @@ test('nothing asks when the policy already allowed it, when the deployment is un
   const delegated = await gated(t, { answers: [{ error: 'DELEGATED_CALLER' }] });
   assert.equal((await execute(delegated.ctx, delegated.a, TOOL)).isError, false, 'a child agent falls through instead of being denied');
   assert.equal(delegated.asked.length, 1);
+});
+test('the on-demand loader is infrastructure, so a project tool filter cannot disable it', { timeout: 40000 }, async t => {
+  const ctx = await harness(t), dir = await workspace(t);
+  await writeFixture(dir, '.mcp.json', { mcpServers: { same: { ...fixtureCommand('filtered'), includeTools: ['identity'] } } });
+  const a = agent(ctx, dir, 'filtered-agent');
+  ctx.agents.enter(a, undefined);
+  ctx.provide('sandboxPolicy', { resolve: () => ({ mode: 'workspace-write' }) });
+  provideSettings(ctx, { trustMode: 'all', trustedWorkspaces: [] });
+  await ctx.plugin(Plugin, { trustMode: 'all' });
+  const admitted = await ctx.tools.resolve({ agent: a, scope: a, modelSelection: {}, signal: signal() });
+  t.after(() => admitted.dispose());
+
+  // On-demand registers only the bridge's loader, which the declaration's own filter does not name.
+  const loader = await callTool(ctx, a, 'mcp__same__load_tools', { tools: ['identity', 'blocked'] }, { callId: 'call-load' });
+  assert.equal(loader.isError, false, `the loader must stay callable: ${textOf(loader)}`);
+  assert.equal((await execute(ctx, a, TOOL)).isError, false, 'the included tool runs');
+  const filtered = await execute(ctx, a, 'mcp__same__blocked');
+  assert.equal(filtered.isError, true, 'a tool the project left out is still refused');
+  assert.match(filtered.error.message, /disabled/);
 });

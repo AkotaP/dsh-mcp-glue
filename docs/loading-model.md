@@ -6,6 +6,8 @@
 
 > **0.2.2-rc.1 / 插件 0.3.1 复核（2026-11-05）**：工具准入时机已变化：`tools.resolve({ agent, modelSelection, signal })` 先固定本步工具，随后 `systemPrompt.assemble({ ..., toolSet })` 组装提示词。`system-prompt/assemble` 的输入只含文字与变量，不再含 `tools`；按旧结构访问会触发 `Cannot read properties of undefined (reading 'flatMap')`。插件在原生 `resolve()` 前协调自己的 Agent，保留准入条件与执行器投影；新文字回调直接放行，旧宿主继续使用增量刷新。已通过针对性回归和实际 0.2.2-rc.1 服务验证，用户另确认重新启用后运行正常。下文仍保留 0.2.0 的历史调查，涉及请求时机时以本条复核为准。
 
+> **0.2.3-alpha.2 / 插件 0.5.0 复核（2026-11-24）**：连接层已改为桥接的 `ctx.mcpClientHost`——挂载、探测、浏览器授权与连接状态机都在 `@deepseek-ai/dsh-mcp-client` 里，本插件不再自建连接、重试与能力嗅探；工具准入仍走 `tools.resolve()`，工具默认按需加载（`toolLoading: 'on-demand'`，由桥接的 `McpToolLoader` 实现目录与 `load_tools`），项目自己的 `includeTools`／`excludeTools` 仍由本插件的 `tools.guard` 执行。下文 0.2.0 / 0.2.2 的链路调查保留作历史，运行时行为以本条、README 与 SKILL.md 为准。
+
 ## 1. 原生加载链路
 
 | 环节 | 事实 |

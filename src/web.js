@@ -127,6 +127,21 @@ export function createWebHandler(control, token, logger) {
         sendJson(res, 200, await control.probe(sessionId, serverId));
         return;
       }
+      if (action === 'authorize' || action === 'cancelAuthorize') {
+        if (req.method !== 'POST') { sendJson(res, 405, { error: 'use POST' }); return; }
+        const body = await readJson(req);
+        const sessionId = sessionOf(body);
+        if (!sessionId) { sendJson(res, 400, { error: 'sessionId is required' }); return; }
+        const serverId = serverOf(body);
+        if (serverId === undefined) { sendJson(res, 400, { error: 'serverId is required' }); return; }
+        // Browser authorization opens a page on the Host; it never carries a token itself, so the
+        // answer is just the refreshed view with the attempt phase (and its URL) on the row.
+        logger?.info?.(`workspace-mcp: ${action === 'authorize' ? 'authorization started' : 'authorization cancelled'} for ${serverId} in session ${sessionId}`);
+        sendJson(res, 200, action === 'authorize'
+          ? await control.authorize(sessionId, serverId)
+          : await control.cancelAuthorization(sessionId, serverId));
+        return;
+      }
       if (action === 'declaration') {
         if (req.method !== 'POST') { sendJson(res, 405, { error: 'use POST' }); return; }
         const body = await readJson(req);

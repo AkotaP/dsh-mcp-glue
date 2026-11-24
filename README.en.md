@@ -2,7 +2,7 @@
 
 [中文](README.md) | English | [Changelog](CHANGELOG.md)
 
-Loads project-level MCP declarations for **DeepSeek Harness 0.2.2-rc.2** (retaining compatibility paths for `0.2.0-rc.2` / `0.2.1-rc.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
+Loads project-level MCP declarations for **DeepSeek Harness 0.2.3** (`engines.dsh: >=0.2.3-alpha.2`). A session reads only its own workspace's configuration and connects servers inside its own Agent scope. The plugin never writes to the global DSH profile and never modifies the declaration files it reads.
 
 ## Built-in presets
 
@@ -27,17 +27,52 @@ The client half registers its copy as `ctx.locale` dictionaries under the packag
 
 The contract, security boundaries and activation rules are in the [management UI document](<docs/management-ui.md>). The client half is the repository's build artifact `lib/client.js` (generated from `src/client.js` by `pnpm run build`); it must be built or the Host reports a missing bundle and refuses to activate. Run `pnpm run build` after changing the client source. Whether the running Host picks up the new bundle automatically depends on its development watcher, so an open page alone proves nothing. **Host**-half changes require profile hot recomposition to re-import modules; restart DSH if hot recomposition is unavailable or the change has not taken effect.
 
-## Auto reconnect
+## The bridge owns the connection
 
-- Supervision covers **only this plugin's mounts** that remain selected (`selected`) and policy-allowed (`autoAllowed`). The native bridge is admitted by **capability**: `0.2.0-rc.2` and `0.2.1-rc.2` — the releases whose lifecycle wording was read — are trusted by version, any other release is enabled as long as it still accepts `reconnect` config and exports `createMcpToolDefinition` (the log then records "version unverified, capabilities confirmed"), and only a module lacking those falls back to native behaviour. A manual (`custom`) selection still qualifies when policy permits; a manually connected, policy-unallowed server gets a single attempt. Disconnect / Stop connecting remains sticky.
-- Transient startup and connection failures retry at **1, 2, 4, 8, 16, 30, 60 seconds × 0.8–1 random jitter**, then keep retrying indefinitely in the 60-second tier. Backoff resets only after **30 seconds** of stable connection. Model requests do not bypass it; recovery, toggling one server and normal declaration updates preserve unchanged healthy peers.
-- An outage of a selected `required` server rejects model requests until recovery without tearing down healthy peers. Background retries that detect a changed target declaration stop with `DECLARATION_CHANGED` until the next safe model-assembly / editor reconcile applies it.
-- The panel shows amber `reconnecting`, a local countdown and attempt count, plus **Stop connecting / Retry now**. Invalid declarations, authentication failures and permanent spawn errors pause retries. Unconfirmed old-process shutdown (`CLOSE_UNCONFIRMED`) blocks even manual retries until a new session or Host restart. An unverified native version/interface explicitly reports unsupported monitoring and falls back to native connections without enhanced reconnect.
-- **Drop detection**: connected HTTP servers are probed read-only (`HEAD`, 1.5 s timeout, no credentials; any HTTP response counts as alive). The first failure withdraws the green dot and shows "Unverified", re-checked after 1.2 s; only two consecutive failures hand the server to the reconnect supervisor, while any real successful call renews the confirmation. Cadence follows activity: 10 s while MCP work happens, 30 s after two minutes, and it stops after five idle minutes. Opening the panel and calling a tool whose confirmation is older than 5 s probe immediately; an unreachable endpoint then fails that call with a clear reason instead of waiting out the tool timeout, and the call is never replayed. `stdio` relies on the child-exit event and is not probed.
-- Failed tools are never replayed; there is no UnityEditor server-startup automation. A typed call error identifying an HTTP session 404 schedules fresh initialization under backoff, without replaying that call.
+DSH 0.2.3's `@deepseek-ai/dsh-mcp-client` publishes `ctx.mcpClientHost` for mounting, probing and authorization, and runs the connection state machine itself (`connecting` / `connected` / `reconnecting` / `failed` / `waiting-authorization` / `waiting-credentials` / `closed`). This plugin no longer keeps its own retry timers and no longer probes capability by version number or internal export names: **the bridge connects, backs off and budgets attempts**, and the plugin only translates the state into the panel's vocabulary, ends an instance whose permission was revoked, and reports a refused declaration field by field.
 
-See the [management UI reconnect contract](<docs/management-ui.md#auto-reconnect>) for details. See the compatibility fix above for 0.3.1 targeted verification and the user-confirmed running deployment after re-enabling. This does not imply live verification of every reconnect or GUI scenario.
+- **Only this plugin's mounts are supervised**: mounting goes through `ctx.mcpClientHost.mount()`, below this session's own scope boundary, so tools register and unregister with the instance.
+- **Reconnect state comes from the bridge**: the panel shows `Reconnecting · Ns` (from `attempt` / `maxAttempts` / `nextRetryAtMs`), `Connection failed` (`gave-up` / `reconnect-disabled`) and the bridge's own failure text. There is no self-built "retry forever at 60 s" policy any more.
+- **Silent loss**: the bridge only learns about a drop when the transport reports one. For HTTP servers the plugin still probes reachability read-only (`HEAD`, 1.5 s timeout, no credentials; any HTTP response counts as alive). The first failure withdraws the green dot as `Unverified` and re-checks 1.2 s later; two consecutive failures **replace the connection generation** (dispose, then mount again), because the bridge cannot report an endpoint that answers nothing. Cadence follows activity: 10 s while MCP traffic happens, 30 s afterwards, and silence after five idle minutes. Opening the panel or calling a tool (once the last confirmation is over 5 s old) probes immediately, so an unreachable server fails that call with a reason instead of a tool timeout; the call is never replayed. `stdio` relies on the child exit event and is never probed.
+- **What the bridge cannot see**: when a server drops the session (a restart invalidates its `Mcp-Session-Id`) but the endpoint still answers, the HTTP transport receives no close and the bridge keeps reporting `connected`. The next tool call fails once and is never replayed; Disconnect followed by Connect in the panel (or a declaration change) re-initializes it. That is a deliberate trade: the plugin does not guess a disconnect from error text.
+- **Cleanup verdicts are trusted**: an instance's `dispose()` returns `closeConfirmed` / `cleanupError`, and an unconfirmed close marks the name unspawnable (`CLOSE_UNCONFIRMED`) until the Host restarts, so an old process is never overlapped.
+- **Revoked permission ends the instance**: saving a profile that no longer allows an automatic connection stops that instance instead of letting the bridge keep retrying it.
 
+See the [management UI connection states](<docs/management-ui.md#connection-states>) for the remaining boundaries.
+
+## Tool loading: on demand or eager
+
+`toolLoading` decides how a server's tools reach the model context. The default is **`on-demand`**: the 0.2.3 bridge lists the tools in the system prompt catalog and registers a single `mcp__<server>__load_tools`, which the model calls for the tools it needs. With several servers declared in one workspace, that removes most tool schemas from the prompt.
+
+| Value | Behaviour | Use it when |
+|---|---|---|
+| `on-demand` (default) | Catalog plus on-demand loading; `catalogDescriptionMaxLength` (default 160) caps each summary | Many servers, many tools, tight context |
+| `eager` | Registers everything at startup, like earlier versions | One server, or the model should see the tools directly |
+
+- The plugin config holds the defaults; **a single declaration can override them** by writing `toolLoading` / `catalogDescriptionMaxLength` on that server in `.mcp.json` (not a field of any dialect — only this plugin reads it).
+- The panel labels such a row `N tools (on demand)` and explains that these tools take no tool slots.
+- On-demand loading does not weaken the tool gate or project filters: a loaded tool is still judged as `mcp__<server>__<tool>`, and `includeTools`/`excludeTools` still apply. The one exception is the **loader itself**: `mcp__<server>__load_tools` is how that filter is delivered rather than one of the tools it names, so a project's `includeTools` cannot disable it — that would make the server's tools unreachable for good. A tool the project excludes still shows up in the catalog and can be loaded, but the guard refuses the call.
+
+## Browser authorization (OAuth)
+
+A Streamable HTTP server can authorize through MCP OAuth: tokens live in the Host credential store and refresh automatically, instead of a hand-written `headers` entry. Declare `oauth`:
+
+```jsonc
+{
+  "mcpServers": {
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "oauth": { "scope": "read" }   // `true`, or an object with any subset of the options
+    }
+  }
+}
+```
+
+- Supported fields: `clientId`, `scope`, `credentialKey`, `requestTimeoutMs`, `authorizationTimeoutMs`. Without `credentialKey` one is derived from the server name and endpoint (`mcp-client/workspace-mcp/<server>-<endpoint digest>`), so a moved endpoint asks for authorization again.
+- A passive connection **never** opens a browser: the row shows `Authorization needed` with the typed reason (`missing` / `expired` / `binding` / `rejected` / `scope`). Choosing Authorize starts DSH's authorization flow (`ctx.authorization` plus the `webServer` callback page); the panel links to the authorization page, and the credential update reconnects the mount.
+- `oauth` cannot coexist with an `Authorization` header (including `bearer_token_env_var`), and a stdio server cannot declare it: both are refused as `INVALID_OAUTH` / `CONFLICTING_AUTH_HEADERS` instead of degrading silently.
+- Both the panel and the CLI can start or cancel an attempt: `POST /workspace-mcp/authorize`, `POST /workspace-mcp/cancelAuthorize`.
 ## Install
 
 Any one of three paths. All of them place the package in the profile's `node_modules`, after which `dsh.bundle.patch` inserts the `workspace-mcp-glue` row; confirm that `dsh-mcp-glue` is enabled on the plugin page.
@@ -59,7 +94,7 @@ The package also ships a troubleshooting skill at `skills/dsh-mcp-glue/` (`SKILL
 
 Runtime code deliberately imports **no** `@deepseek-ai/dsh-*` module: scope identity lives in module-private symbols, and a second copy of those modules turns scoped registrations into global ones. The native MCP bridge is obtained from the Host Cordis loader, which loads the instance the runtime itself uses (see the [investigation notes](<docs/loading-model.md#6-模块实例身份第三方插件的关键约束>)).
 
-`peerDependencies` declares only `@deepseek-ai/dsh: >=0.2.0-rc.2`, marked optional: DSH uses it for version compatibility at install and startup (it recognizes only the `@deepseek-ai/dsh` and `@deepseek-ai/dsh-*` prefixes) and refuses or warns when it is not satisfied. Marking it optional keeps pnpm from installing it and keeps it out of runtime imports. DSH 0.2.1+ actually validates `engines.dsh`; the peer declaration above covers compatibility checks on 0.2.0.
+The requirement lives in `engines.dsh: >=0.2.3-alpha.2`, which DSH really checks: a mismatch disables the plugin or refuses installation (`peerDependencies` is ignored when `engines.dsh` is present). The plugin therefore **deliberately declares no `@deepseek-ai/dsh` peer** — the `ctx.mcpClientHost` contract only exists from 0.2.3, and a peer declaration would drag the whole `@deepseek-ai/dsh` meta package into this package's dev dependencies.
 
 Development and packaging (use Node 22.16+ for `node`/`pnpm`):
 
@@ -122,9 +157,9 @@ When no layer matches, the server **stays unloaded** and the plugin **never open
 - A cancelled or timed-out question is treated as **deny** (fail closed), with the reason in the error.
 - The gate **only covers servers this plugin mounts**: global MCP and servers mounted by other plugins are untouched.
 - The DSH-side event contract, the `exec` fields, the four decision states, the relation to `tools.guard`, and how to determine full access correctly are in the [gate contract](<docs/gate-contract.md>).
-- **A project's own tool filters win over every switch here**: `includeTools`/`excludeTools` (Codex `enabled_tools`/`disabled_tools`, Gemini) are enforced by `tools.guard` **after** this gate, and a guard can only deny. So a tool the project disables is **neither asked about nor re-enabled by the panel**: the gate skips it and the guard rejects it with an exact reason, while the panel marks the row "disabled by project" and offers no switch — no switch that could never take effect.
+- **A project's own tool filters win over every switch here**: `includeTools`/`excludeTools` (Codex `enabled_tools`/`disabled_tools`, Gemini) are enforced by `tools.guard` **after** this gate, and a guard can only deny. So a tool the project disables is **neither asked about nor re-enabled by the panel**: the gate skips it and the guard rejects it with an exact reason, while the panel marks the row "disabled by project" and offers no switch — no switch that could never take effect. The on-demand `mcp__<server>__load_tools` is outside that filter: it is how the filter is delivered, so disabling it would disable the whole server.
 - No other client's auto-trust, OAuth or global user settings are read; a project cannot declare itself trusted.
-- Declaration fields that affect authentication or isolation (OAuth, dynamic headers helpers, remote stdio, per-server sandbox, and so on) cause the server to be **skipped**, never silently downgraded. Native startup errors are logged as sanitized summaries; expanded secrets never reach the plugin log.
+- `oauth` **is** supported (see "Browser authorization"); other fields that affect authentication or isolation (dynamic headers helpers, `authProviderType`, remote stdio, per-server sandbox, and so on) cause the server to be **skipped**, never silently downgraded. The bridge keeps its own sanitized diagnostics; this plugin logs bounded error codes, and expanded secrets never reach its log.
 
 ### Editing configuration (writing declaration files)
 
@@ -225,7 +260,7 @@ Formats: `json`, `jsonc`, `toml`, `yaml`. Dialects: `standard`, `codex`, `gemini
 - The default `conflictPolicy: error` disables same-name servers whose configurations differ between sources; identical declarations are deduplicated. `first-wins`/`last-wins` replace a whole entry and never mix credentials.
 - The plugin supports DSH native **stdio / Streamable HTTP**; `type: http` maps to Streamable HTTP. When no type is given it is inferred from command/url, which is loader-compatible behavior rather than Claude's strict validation.
 - Gemini `httpUrl` is HTTP while `url` is the old SSE, and the two are never confused.
-- SSE, WebSocket, OAuth, dynamic headers helpers, remote stdio and per-server sandbox policies are not supported yet; declarations using them for security or authentication are skipped rather than silently downgraded.
+- SSE, WebSocket, dynamic headers helpers, remote stdio and per-server sandbox policies are not supported yet; declarations using them for security or authentication are skipped rather than silently downgraded. (`oauth` **is** supported.)
 - Codex `enabled_tools`/`disabled_tools` and Gemini `includeTools`/`excludeTools` are enforced as **call restrictions** (exclusions win). A blocked tool may still appear in the schema list, but direct and PTC calls are rejected by the guard. Gemini `trust` never auto-approves tools.
 - Deleting an inherited variable with a null value in VS Code `env` is not supported, and non-string/non-number environment values are rejected. No other client's per-tool approval or output-truncation policy is imported.
 - Non-native safe server names are normalized deterministically with a hash suffix; a name containing `__` or ending in `_` is hashed too, so native unescaped separators cannot overlap tool identities or filter prefixes.

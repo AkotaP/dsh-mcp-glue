@@ -2,130 +2,73 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as NativeMcp from '@deepseek-ai/dsh-mcp-client';
 import { installWorkspaceLoader } from '../src/runtime.js';
-import { agent, harness } from './helpers.js';
+import { agent, fakeHost, harness } from './helpers.js';
 
-test('host JSON metadata uses the same loader resolver and parent URL, not the stack-callback argument', async t => {
+test('the bridge is resolved through the plugin’s loader, and only a host makes the feature work', async t => {
   const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'monitoring');
   ctx.agents.enter(owner, undefined);
-  const requests = [], baseUrl = 'file:///host/profile/cordis.patch.yml';
+  const requests = [];
   const loader = {
-    ctx: { baseUrl },
-    import(...args) { requests.push(['module', ...args]); assert.deepEqual(args, ['@deepseek-ai/dsh-mcp-client']); return NativeMcp; },
+    import(specifier) { requests.push(specifier); return NativeMcp; },
     unwrapExports: value => value,
-    internal: {
-      import(...args) { requests.push(['metadata', ...args]); assert.deepEqual(args, ['@deepseek-ai/dsh-mcp-client/package.json', baseUrl, { type: 'json' }]); return { default: { version: '0.2.0-rc.2' } }; },
-    },
   };
-  const installed = await installWorkspaceLoader(ctx, {}, { resolveLoader: () => loader });
+  const installed = await installWorkspaceLoader(ctx, {}, { resolveLoader: () => loader, health: false });
+  assert.deepEqual(requests, ['@deepseek-ai/dsh-mcp-client'], 'one import, through the Host loader');
   assert.equal(installed.stateFor(owner).monitoring, true);
-  assert.equal(requests.length, 2);
+  assert.equal((await installed.stateFor(owner).status()).monitoring, 'supported');
+
+  // A module that predates `McpClientHost` cannot mount, probe or authorize anything.
+  const bare = await harness(t), other = agent(bare, process.cwd(), 'bare-module');
+  bare.agents.enter(other, undefined);
+  const disabled = await installWorkspaceLoader(bare, {}, { nativePlugin: { name: 'mcp-client', async apply() {} }, health: false });
+  assert.equal(disabled.stateFor(other).monitoring, false);
+  assert.equal((await disabled.stateFor(other).status()).monitoring, 'unsupported');
 });
 
-test('assembly refresh catches background registry changes after the Host snapshot without replaying middleware', async t => {
-  const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'snapshot');
+test('a background reconcile replaces the tool generation the next request sees', async t => {
+  const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'generations');
   ctx.agents.enter(owner, undefined);
-  let generation = 1, move = false, middlewareCalls = 0;
-  const nativePlugin = { name: 'mcp-client', inject: ['tools'], async apply(child) {
-    const label = `generation-${generation}`;
-    child.tools.register({ name: `mcp__wire__tool_${generation}`, description: label,
-      parameters: { type: 'object', properties: {} }, execute: () => label,
-      output: { schema: {}, render: (_args, value) => [{ type: 'text', text: value }] } });
-    child.inject(['systemPrompt'], inner => inner.systemPrompt.section({ name: 'mcp:wire', text: label, order: inner.systemPrompt.getSectionOrder('MCP_SERVERS'), interpolate: false }));
-  } };
-  const plan = { cwd: process.cwd(), fingerprint: 'snapshot', diagnostics: [], servers: [{
+  let generation = 0, move = false, middlewareCalls = 0;
+  const host = fakeHost({
+    mount: record => {
+      const label = `generation-${++generation}`;
+      record.context.tools.register({ name: `mcp__wire__tool_${generation}`, description: label,
+        parameters: { type: 'object', properties: {} }, execute: () => label,
+        output: { schema: {}, render: (_args, value) => [{ type: 'text', text: value }] } });
+      record.context.inject(['systemPrompt'], inner => inner.systemPrompt.section({
+        name: 'mcp:wire', text: label, order: inner.systemPrompt.getSectionOrder('MCP_SERVERS'), interpolate: false,
+      }));
+      return {};
+    },
+  });
+  const plan = { cwd: process.cwd(), fingerprint: 'generations', diagnostics: [], servers: [{
     source: { file: '.mcp.json', preset: 'root', server: 'wire' },
     spec: { config: { serverName: 'wire', transport: 'streamable-http', url: 'http://fixture.invalid/mcp' } },
   }] };
-  const installed = await installWorkspaceLoader(ctx, { trustMode: 'all' }, { nativePlugin, load: async () => plan, health: false });
+  const installed = await installWorkspaceLoader(ctx, { trustMode: 'all' }, { nativePlugin: host.module, load: async () => plan, health: false });
   const state = installed.stateFor(owner);
   await state.reconcile();
+  assert.deepEqual(ctx.tools.schemas(owner).map(schema => schema.name).filter(name => name.startsWith('mcp__wire__')), ['mcp__wire__tool_1']);
   ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
     middlewareCalls++;
     assembly.sections.push({ name: 'independent', text: 'keep this once' });
     if (move) {
       move = false;
       await state.disconnect(undefined, 'wire');
-      generation++;
       await state.connect(undefined, 'wire');
     }
     return next();
   }, { prepend: true });
   move = true;
+  await ctx.systemPrompt.assemble({ scope: owner, agent: owner, signal: new AbortController().signal });
+  // The request that triggered the switch already assembled its providers, so the next request is
+  // the one that must see the new generation — and only it.
   const assembly = await ctx.systemPrompt.assemble({ scope: owner, agent: owner, signal: new AbortController().signal });
-  assert.ok(assembly.tools.some(tool => tool.name === 'mcp__wire__tool_2'));
-  assert.ok(!assembly.tools.some(tool => tool.name === 'mcp__wire__tool_1'));
+  assert.deepEqual(ctx.tools.schemas(owner).map(schema => schema.name).filter(name => name.startsWith('mcp__wire__')), ['mcp__wire__tool_2']);
   assert.ok(assembly.sections.some(section => section.text === 'generation-2'), JSON.stringify(assembly.sections));
-  assert.ok(!assembly.sections.some(section => section.text === 'generation-1'));
+  assert.ok(!assembly.sections.some(section => section.text === 'generation-1'), 'the retired generation contributes nothing');
   assert.equal(assembly.sections.filter(section => section.name === 'independent').length, 1);
-  assert.equal(middlewareCalls, 1);
-});
-
-test('refresh preserves upstream MCP visibility filters, including unrelated global resource tools and changed generations', async t => {
-  const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'filtered');
-  ctx.agents.enter(owner, undefined);
-  ctx.mcpResources.register('global', { request: async () => ({ resources: [] }) });
-  let loadable = false, generation = 0, replace = false;
-  const nativePlugin = { name: 'mcp-client', inject: ['tools'], async apply(child) {
-    const label = `filtered-${++generation}`;
-    child.tools.register({ name: `mcp__wire__tool_${generation}`, description: label,
-      parameters: { type: 'object', properties: {} }, execute: () => label,
-      output: { schema: {}, render: (_args, value) => [{ type: 'text', text: value }] } });
-    child.inject(['systemPrompt'], inner => inner.systemPrompt.section({ name: 'mcp:wire', text: label, order: inner.systemPrompt.getSectionOrder('MCP_SERVERS') }));
-  } };
-  const load = async () => ({ cwd: process.cwd(), fingerprint: String(loadable), diagnostics: [], servers: loadable ? [{
-    source: { file: '.mcp.json', preset: 'root', server: 'wire' }, spec: { config: { serverName: 'wire', transport: 'streamable-http', url: 'http://fixture.invalid/mcp' } },
-  }] : [] });
-  const installed = await installWorkspaceLoader(ctx, { trustMode: 'all' }, { nativePlugin, load, health: false });
-  const state = installed.stateFor(owner);
-  await state.reconcile();
-  ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
-    assembly.tools = assembly.tools.filter(tool => tool.name !== 'read_mcp_resource' && !tool.name.startsWith('mcp__wire__'));
-    assembly.sections = assembly.sections.filter(section => section.name !== 'mcp:wire');
-    if (replace) { replace = false; await state.disconnect(undefined, 'wire'); await state.connect(undefined, 'wire'); }
-    return next();
-  }, { prepend: true });
-  const assemble = () => ctx.systemPrompt.assemble({ scope: owner, agent: owner, signal: new AbortController().signal });
-  const empty = await assemble();
-  assert.equal(state.knownServers.size, 0);
-  assert.ok(!empty.tools.some(tool => tool.name === 'read_mcp_resource'), 'no workspace mount may restore a filtered global resource tool');
-  loadable = true;
-  await state.reconcile();
-  const unchanged = await assemble();
-  assert.ok(!unchanged.tools.some(tool => tool.name.startsWith('mcp__wire__')), 'unchanged raw registrations must not override middleware omissions');
-  replace = true;
-  const changed = await assemble();
-  assert.ok(ctx.tools.get('mcp__wire__tool_2', owner));
-  assert.ok(!changed.tools.some(tool => tool.name.startsWith('mcp__wire__')), 'do not introduce new tool names behind a server filter during refresh');
-  assert.ok(!changed.sections.some(section => section.name === 'mcp:wire'));
-  assert.ok(!changed.tools.some(tool => tool.name === 'read_mcp_resource'));
-  assert.ok(ctx.tools.get('read_mcp_resource', owner), 'global registration remains intact');
-});
-
-test('an upgraded or unreadable version is adapted on proven capabilities, a bare module is refused', async t => {
-  // An upgraded Host must not silently disable the feature: capabilities decide.
-  for (const version of ['0.2.0-rc.3', '0.2.1-rc.2', undefined]) {
-    const ctx = await harness(t), owner = agent(ctx, process.cwd(), `upgraded-${version}`);
-    ctx.agents.enter(owner, undefined);
-    const loader = {
-      import: async specifier => {
-        if (!specifier.endsWith('/package.json')) return NativeMcp;
-        if (version === undefined) throw new Error('metadata unavailable');
-        return { default: { version } };
-      },
-      unwrapExports: value => value,
-    };
-    const installed = await installWorkspaceLoader(ctx, {}, { resolveLoader: () => loader, health: false });
-    const state = installed.stateFor(owner);
-    assert.equal(state.monitoring, true, `version ${String(version)} still proves the adapter's capabilities`);
-    assert.equal((await state.status()).monitoring, 'supported');
-  }
-
-  // A module that cannot accept reconnect config is genuinely unadaptable, whatever it claims.
-  const ctx = await harness(t), owner = agent(ctx, process.cwd(), 'bare-module');
-  ctx.agents.enter(owner, undefined);
-  const bare = { name: 'mcp-client', inject: ['tools'], async apply() {} };
-  const installed = await installWorkspaceLoader(ctx, {}, { nativePlugin: bare, nativeVersion: '9.9.9', health: false });
-  const state = installed.stateFor(owner);
-  assert.equal(state.monitoring, false);
-  assert.equal((await state.status()).monitoring, 'unsupported');
+  assert.equal(middlewareCalls, 2);
+  // The tool provider is the registry itself now, so a retired generation leaves no stale schema.
+  assert.equal(ctx.tools.get('mcp__wire__tool_1', owner), undefined);
 });

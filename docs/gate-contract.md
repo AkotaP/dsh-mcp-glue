@@ -221,6 +221,8 @@ waterfall 语义（`cordis/src/events.ts:224-243`）原文：*"Compose listeners
 - 反过来：`ask` 被用户批准（→ `allow`）之后，**guard 仍会再跑一次**，仍可拒绝——即**用户批准不能突破 guard**；
 - 两者的拒绝都被物化成同一形状：`content: [{type:'text', text: 'Error: <reason>'}]`、`isError: true`（`3243-3257`）；guard 的典型 reason 是 `'Tool disabled by workspace MCP declaration'`（`src/runtime.js:196`）。
 
+本插件的一处例外：按需加载时桥接注册的 `mcp__<server>__load_tools` 是项目工具过滤的**传输手段**，不属于被过滤的工具，因此 pre-execute 与 guard 都按名单跳过它；否则一个写了 `includeTools` 的声明会把加载器一起禁掉，该服务器的工具永远无法加载（回归测试：`test/gate.test.js`、`test/status.test.js`）。
+
 结论：**guard 继续当「同步 deny-only 的硬约束」用，pre-execute 当「需要问人的软闸门」用**，二者不冲突；但若要求「用户批准后一定能跑」，就不能让 guard 覆盖同一工具（否则批准后仍会被 guard 砍掉）。`dsh-agent-preset/skills/cordis-plugin-development/references/practices.md:10` 的选型建议原文：*"From weakest to strongest: `ctx.tools.restrict()` can only remove tools; `ctx.tools.guard()` can only deny; waterfall listeners can rewrite and depend on registration order; ..."*；同文件 `:17` 原文：*"A denial that must hold regardless of order is a `ctx.tools.guard()`; a guard is synchronous, so a decision that must await something, such as asking the user, returns `ask` from `tools/pre-execute`."*
 
 ---

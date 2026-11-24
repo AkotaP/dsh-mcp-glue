@@ -10,6 +10,8 @@
  *   node mcpctl.mjs list              声明文件、条目与当前字段值（含 version）
  *   node mcpctl.mjs probe <serverId>  单台真实握手测试，不注册工具、不动现有连接
  *   node mcpctl.mjs connect [serverId]    显式授权并连接（省略 serverId 为全部）
+ *   node mcpctl.mjs authorize <serverId>  发起/恢复浏览器授权（OAuth），输出授权页链接
+ *   node mcpctl.mjs cancelAuthorize <serverId>  撤回进行中的授权尝试（已保存的授权保留）
  *   node mcpctl.mjs disconnect [serverId] 手动断开（粘性，不删声明）
  *   node mcpctl.mjs follow            放弃手动选择，回到信任策略允许的集合
  *   node mcpctl.mjs config            读取插件当前生效配置
@@ -71,11 +73,18 @@ function summarizeStatus(view) {
       id: server.id,
       state: server.state,
       verified: server.verified,
+      ...(server.loading === undefined ? {} : { loading: server.loading }),
+      ...(server.offeredTools === undefined ? {} : { offeredTools: server.offeredTools }),
+      ...(server.authorization === undefined ? {} : { authorization: server.authorization }),
       required: server.required,
       source: server.source,
       toolCount: (server.tools ?? []).length,
+      ...(server.tools?.length ? { tools: server.tools } : {}),
       error: server.error,
+      ...(server.detail === undefined ? {} : { detail: server.detail }),
       ...(server.errorDetail === undefined ? {} : { errorDetail: server.errorDetail }),
+      // A retrying row is the one case where the schedule matters for a decision: how long to wait.
+      ...(server.state === 'reconnecting' && server.reconnect !== undefined ? { reconnect: server.reconnect } : {}),
       ...(server.warnings?.length ? { warnings: server.warnings.map(item => ({ code: item.code, detail: item.detail })) } : {}),
     })),
   };
@@ -116,6 +125,19 @@ try {
     case 'follow':
       print(summarizeStatus(await call('follow', { sessionId })));
       break;
+    case 'authorize': {
+      if (!rest[0]) { console.error('用法: authorize <serverId>'); process.exit(2); }
+      const view = await call('authorize', { sessionId, serverId: rest[0] });
+      const row = (view.servers ?? []).find(server => server.id === rest[0]);
+      print({ state: row?.state, error: row?.error, authorization: row?.authorization, url: row?.authorization?.authorizationUrl });
+      break;
+    }
+    case 'cancelAuthorize': {
+      if (!rest[0]) { console.error('用法: cancelAuthorize <serverId>'); process.exit(2); }
+      const view = await call('cancelAuthorize', { sessionId, serverId: rest[0] });
+      print(summarizeStatus(view));
+      break;
+    }
     case 'config':
       print(await call('config'));
       break;
@@ -140,7 +162,7 @@ try {
     case undefined:
     case '-h':
     case '--help':
-      console.log('命令: status | list | probe <serverId> | connect [serverId] | disconnect [serverId] | follow | config | write <preset> <name> <json> | remove <serverId>');
+      console.log('命令: status | list | probe <serverId> | connect [serverId] | disconnect [serverId] | authorize <serverId> | cancelAuthorize <serverId> | follow | config | write <preset> <name> <json> | remove <serverId>');
       break;
     default:
       console.error('未知命令: ' + command);

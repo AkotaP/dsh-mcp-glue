@@ -1,15 +1,15 @@
-/** One outage keeps its budget until a connection has stayed up for this long. */
-export const STABLE_MS = 30000;
-const DELAYS = [1000, 2000, 4000, 8000, 16000, 30000, 60000];
+/**
+ * The only connection policy this plugin still owns.
+ *
+ * Reconnection, its backoff and its attempt budget belong to the native MCP client supervisor
+ * (see `McpConnectionStatus`), so what remains here is the startup/recovery concurrency cap.
+ */
+
 export const realClock = {
   now: () => Date.now(), random: () => Math.random(),
   setTimeout: (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
   clearTimeout: timer => clearTimeout(timer),
 };
-/** Bounded jitter never exceeds the 60-second ceiling. No permanent attempt cap. */
-export function retryDelay(attempt, random = Math.random) {
-  return Math.round(DELAYS[Math.min(Math.max(0, attempt - 1), DELAYS.length - 1)] * (0.8 + 0.2 * random()));
-}
 
 /** A shared startup/recovery cap; cancelled waiters never retain a permit or start late. */
 export function createConnectionLimiter(limit) {

@@ -1,10 +1,9 @@
 import { isDeepStrictEqual } from 'node:util';
 import { createDeclarationEditor } from './edit.js';
 import { loadWorkspace } from './load.js';
-import { publicToolName } from './normalize.js';
+import { publicToolName, loaderToolName } from './normalize.js';
 import { SERVER_STATES, buildStatus } from './status.js';
-import { createNativeAdapter, classifyConnectionError, nativeBridgeSupport } from './bridge.js';
-import { realClock, retryDelay, STABLE_MS, createConnectionLimiter } from './retry.js';
+import { realClock, createConnectionLimiter } from './retry.js';
 import { HEALTH, probeHttp, probeTarget } from './health.js';
 import { installToolPreparation } from './step.js';
 
@@ -34,6 +33,24 @@ async function disposeFiber(fiber) {
  * realistic workspace while still never spawning all `maxServers` (up to 128) at once.
  */
 const MOUNT_CONCURRENCY = 6;
+
+/**
+ * Extra wait on top of the bridge's own startup budget.
+ *
+ * The bridge already bounds one connection attempt plus its initial tool sync, so this only
+ * covers reporting: the mount settles a moment after its budget expires. It deliberately does
+ * not tear the instance down — a supervisor that is still trying is more truthful than a
+ * timeout, and the next status update replaces this one.
+ */
+const NATIVE_STARTUP_GRACE_MS = 5000;
+
+/** The panel's bounded reason code for a native terminal state. */
+function failureCodeOf(reason) {
+  if (reason === 'unclosed-generation') return 'CLOSE_UNCONFIRMED';
+  if (reason === 'gave-up') return 'RECONNECT_GAVE_UP';
+  if (reason === 'reconnect-disabled') return 'RECONNECT_DISABLED';
+  return 'CONNECTION_LOST';
+}
 
 /** Run `run` over `items` with at most `limit` in flight; `run` owns its own failures. */
 async function mapLimit(items, limit, run) {
@@ -66,44 +83,9 @@ export async function loadNativeBridge(ctx, resolveLoader = () => ctx.get('loade
   return loader.unwrapExports(await loader.import('@deepseek-ai/dsh-mcp-client'));
 }
 
-// Read the public assembler's base without replaying unrelated waterfall middleware.
-// `owner` must be a context that injects systemPrompt; the Agent travels in `context.scope`.
-async function baseAssembly(owner, context) {
-  const inner = owner.extend({ waterfall: (...args) => args[1] === 'system-prompt/assemble'
-    ? args.at(-1)() : owner.waterfall(...args) });
-  return inner.systemPrompt.assemble(context);
-}
-/**
- * Copy only what changed since `previous` into the assembly already built for
- * this request, so this very model request sees the new tools, resources and
- * server instructions without re-running any assemble middleware.
- */
-function refreshBaseDelta(assembly, previous, fresh) {
-  for (const field of ['sections', 'contexts', 'tools']) {
-    const old = new Map(previous[field].map(item => [item.name, item]));
-    const changed = new Set([...old.keys(), ...fresh[field].map(item => item.name)]
-      .filter(name => !isDeepStrictEqual(old.get(name), fresh[field].find(item => item.name === name))));
-    const replacements = new Map(fresh[field].filter(item => changed.has(item.name)).map(item => [item.name, item]));
-    assembly[field] = assembly[field].flatMap(item => changed.has(item.name)
-      ? replacements.has(item.name) ? [replacements.get(item.name)] : [] : [item]);
-    for (let index = 0; index < fresh[field].length; index++) {
-      const item = fresh[field][index];
-      if (!changed.has(item.name) || assembly[field].some(current => current.name === item.name)) continue;
-      const nextNames = fresh[field].slice(index + 1).map(next => next.name);
-      const position = assembly[field].findIndex(current => nextNames.includes(current.name));
-      assembly[field].splice(position < 0 ? assembly[field].length : position, 0, item);
-    }
-  }
-  for (const name of new Set([...Object.keys(previous.variables), ...Object.keys(fresh.variables)])) {
-    if (isDeepStrictEqual(previous.variables[name], fresh.variables[name])) continue;
-    if (Object.hasOwn(fresh.variables, name)) assembly.variables[name] = fresh.variables[name];
-    else delete assembly.variables[name];
-  }
-}
-
 /** Idempotent, ordered per-Agent lifecycle. Never registers project tools globally. */
 export class WorkspaceMcpSession {
-  constructor(agent, config, { load = loadWorkspace, nativePlugin, nativeVersion = '0.2.0-rc.2', clock = realClock, fetchImpl = fetch, health = true, makeBoundary = createBoundary, logger, scopeOwner, optionalServices } = {}) {
+  constructor(agent, config, { load = loadWorkspace, nativePlugin, clock = realClock, fetchImpl = fetch, health = true, makeBoundary = createBoundary, logger, scopeOwner, optionalServices } = {}) {
     this.agent = agent; this.config = config; this.load = load;
     this.nativePlugin = nativePlugin; this.makeBoundary = makeBoundary;
     this.clock = clock;
@@ -112,7 +94,12 @@ export class WorkspaceMcpSession {
     this.healthEnabled = health !== false;
     /** Last time this session did anything MCP-shaped: it gates the probe cadence. */
     this.lastActivityAt = clock.now();
-    this.monitoring = nativeBridgeSupport(nativePlugin, nativeVersion) !== undefined;
+    /**
+     * Whether this Host publishes the MCP client host. Everything else here is built on it:
+     * mounting, probing and authorization all go through the bridge's own API instead of
+     * re-implementing its lifecycle, so its absence is the only unsupported composition.
+     */
+    this.monitoring = typeof nativePlugin?.McpClientHost === 'function';
     this.mounts = new Map();
     this.knownServers = new Set();
     this.background = new Set();
@@ -123,8 +110,12 @@ export class WorkspaceMcpSession {
     this.logger = logger ?? agent.ctx.logger;
     // A context that injects `tools`/`systemPrompt`, used for the guard and base assemblies.
     this.scopeOwner = scopeOwner ?? agent.ctx;
-    /** Cached `ctx.mcpClientHost`; see {@link WorkspaceMcpSession#probeHost}. */
-    this.probeHostRef = undefined;
+    /** The native host of this session; see {@link WorkspaceMcpSession#sessionHost}. */
+    this.host = undefined;
+    /** Browser-authorization owners by server name; see {@link WorkspaceMcpSession#authorizationOwner}. */
+    this.authOwners = new Map();
+    /** Disposal verdict per native instance, so a late activation cannot end it a second time. */
+    this.releaseResults = new WeakMap();
     /** Services the Agent's own context may not reach (see the entry file's inject note). */
     this.optionalServices = optionalServices ?? {};
     this.abort = new AbortController(); this.queue = Promise.resolve(); this.closed = false;
@@ -174,7 +165,7 @@ export class WorkspaceMcpSession {
       this.allowance.workspace ?? '-',
       [...this.effectiveSelection()].sort().join(','),
       this.requiredFailure ? 'required-failed' : '-',
-      [...this.serverStates.entries()].map(([name, value]) => JSON.stringify([name, value.state, value.tools, value.error, value.reconnect, this.verified(value) ? 1 : 0])).sort().join(','),
+      [...this.serverStates.entries()].map(([name, value]) => JSON.stringify([name, value.state, value.tools, value.error, value.reconnect, this.verified(value) ? 1 : 0, this.authorizationView(name)?.phase ?? '-'])).sort().join(','),
       JSON.stringify(this.allowance),
       this.monitoring ? 'monitored' : 'unsupported',
     ].join('|');
@@ -220,8 +211,9 @@ export class WorkspaceMcpSession {
       try {
         this.guardDisposer = owner.tools.guard(exec => {
           if (exec.agent !== this.agent) return undefined;
-          for (const { prefix, allow, deny } of this.toolFilters.values()) {
+          for (const { prefix, loader, allow, deny } of this.toolFilters.values()) {
             if (!exec.name.startsWith(prefix)) continue;
+            if (loader !== undefined && exec.name === loader) continue;
             if (owner.tools.get(exec.name, this.agent) === owner.tools.get(exec.name)) continue;
             if (deny.has(exec.name) || (allow !== undefined && !allow.has(exec.name))) return 'Tool disabled by workspace MCP declaration';
           }
@@ -284,8 +276,9 @@ export class WorkspaceMcpSession {
    * @returns the reason code when the declaration refuses the tool, else undefined.
    */
   declaredUnavailable(publicTool) {
-    for (const { prefix, allow, deny } of this.toolFilters.values()) {
+    for (const { prefix, loader, allow, deny } of this.toolFilters.values()) {
       if (!publicTool.startsWith(prefix)) continue;
+      if (loader !== undefined && publicTool === loader) continue;
       if (deny.has(publicTool)) return 'declared-disabled';
       if (allow !== undefined && !allow.has(publicTool)) return 'declared-not-enabled';
     }
@@ -423,7 +416,9 @@ export class WorkspaceMcpSession {
       selected: this.effectiveSelection(),
       autoAllowed: this.policyAllowed,
       selectionMode: this.selectionMode,
-      mounted: this.group !== undefined,
+      // "Loaded" means a generation is mounted right now, not that the session ever had one:
+      // the session's own boundary outlives a disconnect.
+      mounted: this.mounts.size > 0,
       serverStates: this.serverStates,
       requiredFailure: this.requiredFailure,
       monitoring: this.monitoring,
@@ -531,66 +526,15 @@ export class WorkspaceMcpSession {
     this.allowance = found;
     return found;
   }
-  /** Only native contributions: unrelated assembly middleware must not be replayed or removed. */
-  nativeAssemblySlice(base) {
-    const names = [...this.knownServers];
-    const resourceTools = ['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource'];
-    return {
-      sections: base.sections.filter(item => item.name === 'mcp-resource-servers' || names.some(name => item.name === `mcp:${name}`)),
-      tools: base.tools.filter(item => resourceTools.includes(item.name) || names.some(name => item.name.startsWith(`mcp__${name}__`))),
-      contexts: [], variables: {},
-    };
-  }
-  /** Synchronous observer called by the Host's base tool provider, before assembly middleware. */
-  assemblyFrame() {
-    const tools = this.nativeAssemblySlice({ sections: [], tools: this.scopeOwner.tools.schemas(this.agent) }).tools
-      .map(({ name, description, parameters, deferLoading }) => ({ name, description, parameters: structuredClone(parameters), ...(deferLoading === true ? { deferLoading } : {}) }));
-    const servers = new Map([...this.knownServers].map(name => {
-      const record = this.mounts.get(name);
-      return [name, [record, record?.token, record?.boundary, this.serverStates.get(name)?.state]];
-    }));
-    return { tools, servers };
-  }
-  refreshAssembly(assembly, frame, fresh) {
-    const current = this.assemblyFrame();
-    const names = new Set([...frame.servers.keys(), ...current.servers.keys()]);
-    const changed = [...names].filter(name => {
-      const before = frame.servers.get(name) ?? [], after = current.servers.get(name) ?? [];
-      return before.length !== after.length || before.some((value, index) => value !== after[index]);
-    });
-    const owned = this.nativeAssemblySlice(fresh);
-    const resourceTools = new Set(['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource']);
-    const previousTools = changed.length > 0 ? frame.tools : frame.tools.filter(tool => !resourceTools.has(tool.name));
-    if (changed.length === 0) owned.tools = owned.tools.filter(tool => !resourceTools.has(tool.name));
-    // Preserve upstream presentation/privacy filters. An absent old schema is an
-    // explicit omission, not a missing contribution for us to restore. If a filter
-    // touched a server, defer its newly introduced tool names until the next snapshot.
-    const hidden = new Set(frame.tools.filter(tool => !assembly.tools.some(item => item.name === tool.name)).map(tool => tool.name));
-    const filteredServers = [...names].filter(name => frame.tools.some(tool => hidden.has(tool.name) && tool.name.startsWith(`mcp__${name}__`)));
-    const oldNames = new Set(frame.tools.map(tool => tool.name));
-    owned.tools = owned.tools.filter(tool => !hidden.has(tool.name)
-      && (oldNames.has(tool.name) || !filteredServers.some(name => tool.name.startsWith(`mcp__${name}__`))));
-    const sectionChanged = item => changed.some(name => item.name === `mcp:${name}`)
-      || (changed.length > 0 && item.name === 'mcp-resource-servers');
-    owned.sections = owned.sections.filter(section => {
-      if (assembly.sections.some(item => item.name === section.name)) return true;
-      if (section.name === 'mcp-resource-servers') return false;
-      const server = changed.find(name => section.name === `mcp:${name}`);
-      return !frame.servers.get(server)?.[2]; // Do not restore a deliberately omitted old section.
-    });
-    refreshBaseDelta(assembly, {
-      sections: assembly.sections.filter(sectionChanged), tools: previousTools, contexts: [], variables: {},
-    }, { ...owned, sections: owned.sections.filter(sectionChanged) });
-  }
-  /** A profile save revokes retry authority immediately, including an initialize in flight. */
+  /** A profile save revokes connection authority immediately, including an attempt in flight. */
   async policyChanged() {
     const interrupted = [];
-    // Cancel initialization before waiting for the serialized work that owns it.
+    // Interrupt the in-flight activation before waiting for the serialized work that owns it.
     if (this.plan) {
       await this.refreshPolicy(this.plan, this.abort.signal);
       for (const record of this.mounts.values()) {
         if (!this.effectiveSelection().has(record.name)) this.cancelRecord(record);
-        else if (record.autoAuthority && record.connectedAt === undefined && !this.eligible(record)) {
+        else if (record.autoAuthority && record.instance !== undefined && !this.eligible(record)) {
           record.controller?.abort(new Error('automatic connection permission revoked'));
           if (record.task) interrupted.push(record.task);
         }
@@ -600,11 +544,9 @@ export class WorkspaceMcpSession {
       if (!this.plan) return;
       await this.refreshPolicy(this.plan, this.abort.signal);
       for (const record of [...this.mounts.values()]) {
-        if (record.stopped || !this.effectiveSelection().has(record.name)) { await this.retire(record); continue; }
-        if (record.timer !== undefined && !this.eligible(record)) {
-          this.clock.clearTimeout(record.timer); record.timer = undefined;
-          this.viewRecord(record, SERVER_STATES.failed, record.error);
-        } else if (record.down && record.retryable && this.eligible(record)) this.schedule(record);
+        // Losing authority is not a retry condition any more: the bridge would keep reconnecting
+        // a server this profile no longer allows, so the instance is retired instead.
+        if (record.stopped || !this.effectiveSelection().has(record.name) || !this.eligible(record)) { await this.retire(record); continue; }
         const live = this.serverStates.get(record.name);
         if (live?.reconnect) live.reconnect.eligible = this.eligible(record);
       }
@@ -636,30 +578,144 @@ export class WorkspaceMcpSession {
     return !this.closed && !record.stopped && this.mounts.get(record.name) === record && record.token === token;
   }
   /**
-   * The native status handle for one mounted fiber, on releases that publish one (0.2.2+).
+   * The native host every mount, probe and authorization of this session goes through.
    *
-   * Reading it must never make a connection fail: a missing or throwing accessor degrades to
-   * the log-text path the adapter keeps as a fallback.
+   * The bridge publishes `ctx.mcpClientHost` for exactly this purpose, so this plugin stops
+   * re-implementing the connection lifecycle. The host is created below this agent's own scope
+   * boundary rather than reusing an injected one: the instances it mounts register their tools
+   * in that agent's scope and end with it, which is the isolation this plugin exists to provide.
+   * @returns the host, or undefined when the loaded bridge is too old to publish one.
    */
-  nativeStatus(fiber) {
+  sessionHost() {
+    if (this.host !== undefined) return this.host;
+    const HostClass = this.nativePlugin?.McpClientHost;
+    if (typeof HostClass !== 'function') return undefined;
+    this.group ??= this.makeBoundary(this.agent.ctx);
     try {
-      const read = this.nativePlugin?.connectionStatusOf;
-      return typeof read === 'function' && fiber !== undefined
-        ? read.call(this.nativePlugin, fiber) : undefined;
-    } catch { return undefined; }
+      // The host is a Cordis service, and one provider slot exists per service name — so each
+      // session provides its own under an isolated name. Sharing a slot would make the second
+      // session's host construction throw, and reusing a composition's host would put this
+      // agent's tools in that host's scope instead of this one.
+      this.host = new HostClass(this.group.ctx.isolate('mcpClientHost'));
+    } catch (error) {
+      this.logger.warn(`workspace-mcp: the MCP client host could not be created: ${error?.message ?? error}`);
+      this.host = undefined;
+    }
+    return this.host;
   }
-  viewRecord(record, state, error, nextRetryAt = null) {
-    this.serverStates.set(record.name, {
-      state, tools: state === SERVER_STATES.connected ? this.toolNamesFor(record.name) : [], error,
-      reconnect: { eligible: this.eligible(record), attempt: record.failures, nextRetryAt, reason: error ?? null },
+  /**
+   * The configuration actually handed to the bridge: declaration values plus what this plugin
+   * owns. Reconnection and startup budgets stay the bridge's, so there is one supervisor.
+   */
+  mountConfig(spec) {
+    const config = { ...spec.config };
+    // The typed status is what reports a failed attempt now, so a failed first connect must
+    // not reject the plugin fiber: that would hide `waiting-authorization` behind an error.
+    config.failOnStartupError = false;
+    config.toolLoading = config.toolLoading ?? this.loadingMode();
+    config.catalogDescriptionMaxLength = config.catalogDescriptionMaxLength
+      ?? this.config.catalogDescriptionMaxLength ?? 160;
+    const startupTimeoutMs = spec.startupTimeoutMs ?? this.config.startupTimeoutMs;
+    if (startupTimeoutMs !== undefined) config.startupTimeoutMs = startupTimeoutMs;
+    return config;
+  }
+  /** `on-demand` unless this profile asked for eager registration. */
+  loadingMode() {
+    return this.config.toolLoading === 'eager' ? 'eager' : 'on-demand';
+  }
+  /**
+   * Resolve one server configuration through the bridge's own schema.
+   *
+   * This is the half of validation this plugin cannot duplicate: field defaults, the server-name
+   * pattern, template syntax and the OAuth/Authorization conflict are the bridge's contract, and
+   * asking it means a declaration is refused with the same wording its own loader would use.
+   * @throws a {@link DeclarationError}-shaped error carrying the bridge's message.
+   */
+  validateConfig(config, name) {
+    const host = this.sessionHost();
+    if (host === undefined || typeof host.validate !== 'function') return config;
+    try { return host.validate(config, ['mcp', name]); }
+    catch (error) {
+      throw Object.assign(new Error(error?.message ?? 'invalid MCP server configuration'), { code: 'INVALID_CONFIG' });
+    }
+  }
+  /**
+   * The parts of a management row this plugin owns, independent of the native state machine.
+   *
+   * They are re-read on every status publication so a probe's confirmation, a changed loading
+   * mode and the current authorization attempt are never lost to a transitional native state.
+   */
+  viewBase(record) {
+    return {
+      tools: [],
+      error: undefined,
+      detail: undefined,
+      /** Native attempt bookkeeping; replaced wholesale by a `reconnecting` status. */
+      reconnect: { eligible: this.eligible(record), attempt: 0, maxAttempts: null, nextRetryAt: null, reason: null },
       /** Whether this transport is covered by reachability probing at all. */
       http: probeTarget(record.entry?.spec) !== undefined,
       /** Cleared by a failed probe, so one bad probe withdraws the green claim immediately. */
       confirmed: record.confirmed !== false,
       lastVerifiedAt: record.lastVerifiedAt,
-    });
-    this.requiredFailure = [...this.mounts.values()].some(item => item.entry.spec.required
-      && this.effectiveSelection().has(item.name) && this.serverStates.get(item.name)?.state !== SERVER_STATES.connected);
+      toolLoading: record.entry?.spec.config.toolLoading ?? this.loadingMode(),
+      authorization: this.authorizationView(record.name),
+    };
+  }
+  /** Publish one row's state; everything else in the view is recomputed from the record. */
+  setView(record, patch) {
+    this.serverStates.set(record.name, { ...this.viewBase(record), ...patch });
+    this.publish();
+  }
+  /**
+   * Mirror one native connection status into the row.
+   *
+   * The bridge's state machine is the single source of truth for connection state, including
+   * `waiting-authorization` and its typed reason: this plugin translates it into panel
+   * vocabulary and adds the two things the row shows beyond it (reachability confirmation and
+   * the authorization attempt).
+   */
+  nativeView(record, status) {
+    const view = this.viewBase(record);
+    switch (status?.state) {
+      case 'connected':
+        record.down = false;
+        this.serverStates.set(record.name, { ...view, state: SERVER_STATES.connected, tools: this.toolNamesFor(record.name), toolCount: status.toolCount, connectedAt: status.connectedAt });
+        break;
+      case 'connecting':
+        this.serverStates.set(record.name, { ...view, state: SERVER_STATES.pending });
+        break;
+      case 'reconnecting':
+        record.down = true;
+        this.serverStates.set(record.name, {
+          ...view, state: SERVER_STATES.reconnecting, error: 'CONNECTION_LOST', detail: status.lastError,
+          reconnect: { ...view.reconnect, attempt: status.attempt, maxAttempts: status.maxAttempts, nextRetryAt: status.nextRetryAtMs, reason: status.lastError },
+        });
+        break;
+      case 'failed':
+        record.down = true;
+        // An unclosed generation can overlap a new child process, so this name may never respawn.
+        if (status.reason === 'unclosed-generation') this.unsafeNames.add(record.name);
+        this.serverStates.set(record.name, {
+          ...view, state: SERVER_STATES.failed, error: failureCodeOf(status.reason), detail: status.lastError,
+        });
+        break;
+      case 'waiting-authorization':
+        record.down = true;
+        this.serverStates.set(record.name, {
+          ...view, state: SERVER_STATES.authorization, error: 'AUTHORIZATION_REQUIRED', detail: status.lastError,
+          authorization: { ...view.authorization, reason: status.reason, lastError: status.lastError },
+        });
+        break;
+      case 'waiting-credentials':
+        record.down = true;
+        this.serverStates.set(record.name, { ...view, state: SERVER_STATES.failed, error: 'MISSING_CREDENTIALS', detail: status.lastError });
+        break;
+      case 'closed':
+        this.serverStates.set(record.name, { ...view, state: record.stopped ? SERVER_STATES.unloaded : SERVER_STATES.failed, error: status.result?.closeConfirmed === false || status.result?.cleanupError !== undefined ? 'CLOSE_UNCONFIRMED' : undefined });
+        break;
+      default:
+        this.serverStates.set(record.name, view);
+    }
     this.publish();
   }
   /**
@@ -750,18 +806,37 @@ export class WorkspaceMcpSession {
       record.probeFailures = 0;
       record.confirmed = true;
       record.lastVerifiedAt = this.clock.now();
-      this.viewRecord(record, SERVER_STATES.connected, undefined);
+      this.setView(record, { state: SERVER_STATES.connected, tools: this.toolNamesFor(record.name) });
       return result;
     }
     record.probeFailures += 1;
     record.confirmed = false;
-    this.viewRecord(record, SERVER_STATES.connected, undefined); // still connected, just unconfirmed
+    // Still connected as far as the bridge knows, just no longer confirmed by anyone.
+    this.setView(record, { state: SERVER_STATES.connected, tools: this.toolNamesFor(record.name), error: result.code ?? 'PROBE_FAILED' });
     if (record.probeFailures >= HEALTH.failuresToOffline) {
-      this.logger.info(`workspace-mcp: ${record.name} unreachable (${result.code}); reconnecting`);
-      await this.enqueue(() => this.current(record, token) && !record.down
-        ? this.failed(record, { code: result.code ?? 'PROBE_FAILED', retryable: true }) : undefined).catch(() => {});
+      this.logger.info(`workspace-mcp: ${record.name} unreachable (${result.code}); replacing the connection`);
+      await this.enqueue(() => this.current(record, token) ? this.reconnectRecord(record) : undefined).catch(() => {});
     } else this.scheduleHealth(record, HEALTH.confirmMs);
     return result;
+  }
+  /**
+   * Replace one connection generation.
+   *
+   * Reachability probing exists for transports whose death is silent. When it proves the
+   * endpoint gone, the honest recovery is the one the bridge performs itself: end the instance
+   * (which stops its supervisor) and mount a fresh one. An unconfirmed cleanup still blocks the
+   * respawn, exactly as it does for every other path.
+   */
+  async reconnectRecord(record) {
+    const instance = record.instance; record.instance = undefined;
+    if (instance === undefined) return;
+    await this.release(record, instance);
+    if (!this.current(record) || !this.eligible(record)) return;
+    if (this.unsafeNames.has(record.name)) {
+      this.setView(record, { state: SERVER_STATES.failed, error: 'CLOSE_UNCONFIRMED' });
+      return;
+    }
+    await this.startRecord(record, this.abort.signal, true);
   }
   /**
    * The model is about to call one of this server's tools: a stale confirmation is worth
@@ -781,40 +856,59 @@ export class WorkspaceMcpSession {
   }
   cancelRecord(record) {
     record.stopped = true;
-    this.clock.clearTimeout(record.timer); record.timer = undefined;
     this.clock.clearTimeout(record.probeTimer); record.probeTimer = undefined;
-    record.controller?.abort(new Error('workspace MCP connection stopped'));
+    // Teardown must never depend on a listener staying quiet: an abort reason is data, not a
+    // failure of the disposal that raises it.
+    // No custom reason: a cancellation reads as the platform's AbortError, which every consumer
+    // (including the bridge's own supervisors) already treats as "stop, do not report".
+    try { record.controller?.abort(); }
+    catch { /* a throwing abort listener is not a teardown failure */ }
   }
-  async closeBoundary(record, boundary, token = record.token) {
-    if (record.closingBoundary === boundary && record.closing) { await record.closing; return; }
-    record.closingBoundary = boundary;
-    record.closingToken = token;
-    const closing = Promise.resolve().then(() => boundary.dispose()).then(() => {
-      // 0.2.2+ records the transport and local cleanup outcome on the status cell instead of
-      // logging it. A disposal that "succeeded" can still leave the child process alive, so an
-      // unconfirmed closure or a cleanup error must block any respawn under this name.
-      const result = this.nativeStatus(record.fiber)?.closure?.();
-      if (result !== undefined && (result.closeConfirmed === false || typeof result.cleanupError === 'string')) {
-        throw Object.assign(new Error('workspace-mcp: native transport closure unconfirmed'), { code: 'CLOSE_UNCONFIRMED' });
-      }
-    }).catch(() => {
-      this.unsafeNames.add(record.name);
+  /**
+   * Dispose one native instance and keep its cleanup verdict.
+   *
+   * The bridge returns the transport and local cleanup outcome itself, so an instance that
+   * "disposed" but left a child process behind is reported here instead of guessed from logs.
+   * An unconfirmed closure marks the name unsafe: respawning under it could overlap the old
+   * process, so it never happens without a Host restart.
+   */
+  async release(record, instance, { checkName = true } = {}) {
+    if (instance === undefined) return { closeConfirmed: true };
+    // An activation that settles after its instance was already ended must not end it twice.
+    const previous = this.releaseResults.get(instance);
+    if (previous !== undefined) return previous;
+    // Detach first: a second caller (a retirement racing the startup catch) must not dispose the
+    // same instance twice.
+    if (record.instance === instance) record.instance = undefined;
+    record.unsubscribe?.(); record.unsubscribe = undefined;
+    if (record.handle !== undefined && record.instance === instance) record.handle = undefined;
+    let result = { closeConfirmed: true };
+    try { result = (await instance.dispose()) ?? result; }
+    catch (error) { result = { closeConfirmed: false, cleanupError: String(error?.message ?? error) }; }
+    this.releaseResults.set(instance, result);
+    if (result.closeConfirmed === false || typeof result.cleanupError === 'string') {
+      if (checkName) this.unsafeNames.add(record.name);
       this.logger.warn(`workspace-mcp: ${record.name} CLOSE_UNCONFIRMED (details redacted)`);
-    });
-    record.closing = closing;
-    try { await closing; }
-    finally {
-      if (record.closing === closing) { record.closing = undefined; record.closingBoundary = undefined; }
-      if (record.closingToken === token) record.closingToken = undefined;
+      this.setView(record, { state: SERVER_STATES.failed, error: 'CLOSE_UNCONFIRMED' });
     }
+    return result;
+  }
+  /** End one server's authorization owner, releasing its callback route and any pending attempt. */
+  async retireAuthorization(name) {
+    const entry = this.authOwners.get(name);
+    this.authOwners.delete(name);
+    if (entry === undefined) return;
+    try { await entry.owner.dispose(); }
+    catch (error) { this.logger.warn(`workspace-mcp: ${name} OAuth owner cleanup failed (details redacted)`); }
   }
   async retire(record) {
     this.cancelRecord(record);
     this.mounts.delete(record.name);
-    const boundary = record.boundary; record.boundary = undefined;
-    if (boundary) await this.closeBoundary(record, boundary);
-    if (record.closing) await record.closing;
-    if (record.task) await record.task;
+    const instance = record.instance; record.instance = undefined;
+    if (instance !== undefined) await this.release(record, instance);
+    else { record.unsubscribe?.(); record.unsubscribe = undefined; }
+    if (record.task) await record.task.catch(() => {});
+    await this.retireAuthorization(record.name);
     this.toolFilters.delete(record.name);
     this.serverStates.delete(record.name);
   }
@@ -824,151 +918,96 @@ export class WorkspaceMcpSession {
     this.queue = operation.catch(() => { this.logger.warn('workspace-mcp: background connection task failed (details redacted)'); });
     return operation.finally(() => this.publish());
   }
-  nativeEvent(record, token, event) {
-    // A answered request is proof of life and needs no queue: record it inline so the next
-    // tool call skips its pre-check entirely.
-    if (event.kind === 'request-ok') {
-      if (!this.current(record, token)) return;
+  /** Mirror one native status change into the row; the bridge owns the state machine. */
+  nativeStatus(record, token, status) {
+    if (status === undefined || !this.current(record, token)) return;
+    // A live connection is its own confirmation: reachability probing only exists for
+    // transports whose death the transport itself cannot report.
+    if (status.state === 'connected') {
+      record.connectedAt = status.connectedAt;
       record.lastVerifiedAt = this.clock.now();
-      record.probeFailures = 0;
       record.confirmed = true;
-      this.lastActivityAt = record.lastVerifiedAt;
-      this.publish();
-      return;
+      record.probeFailures = 0;
     }
-    if (event.kind === 'status') {
-      // 0.2.2+ state machine. Only the post-connect failure is news here: an initial failure
-      // already rejects the native apply and reaches startRecord's catch, and every other
-      // transition is either mirrored by the mount result or means "disposing".
-      const status = event.status;
-      if (status?.state !== 'failed' || record.down || record.connectedAt === undefined) return;
-      // An unclosed generation blocks replacement outright: respawning could overlap the old
-      // server process, so mark the name unsafe and stop retrying it.
-      if (status.reason === 'unclosed-generation') {
-        this.unsafeNames.add(record.name);
-        record.error = 'CLOSE_UNCONFIRMED'; record.retryable = false;
-        this.viewRecord(record, SERVER_STATES.failed, record.error);
-        return;
-      }
-      if (!this.current(record, token)) return;
-      void this.enqueue(() => this.current(record, token) && !record.down
-        ? this.failed(record, { code: 'CONNECTION_LOST', retryable: true }) : undefined).catch(() => {});
-      return;
-    }
-    if (event.kind === 'unsafe-close' && (this.current(record, token) || record.closingToken === token)) this.unsafeNames.add(record.name);
-    if (!this.current(record, token)) return;
-    // Never dispose from the native logger/execute call stack.
-    void this.enqueue(async () => {
-      if (!this.current(record, token)) return;
-      if (event.kind === 'unsafe-close') {
-        this.clock.clearTimeout(record.timer); record.timer = undefined;
-        if (!record.down) await this.failed(record, { code: 'CLOSE_UNCONFIRMED', retryable: false });
-        record.error = 'CLOSE_UNCONFIRMED'; record.retryable = false;
-        this.viewRecord(record, SERVER_STATES.failed, record.error);
-      }
-      else if (event.kind === 'disconnected' || event.kind === 'request-failed') {
-        await this.failed(record, { code: event.code, retryable: event.retryable !== false });
-      }
-    }).catch(() => {});
+    this.nativeView(record, status);
+    // Schedule after the row is published: the heartbeat only applies to a row the view already
+    // reports as connected.
+    if (status.state === 'connected') this.scheduleHealth(record);
   }
-  schedule(record) {
-    if (!this.current(record) || !record.down || record.closing || record.timer !== undefined) return;
-    if (this.unsafeNames.has(record.name)) { record.error = 'CLOSE_UNCONFIRMED'; record.retryable = false; }
-    if (!record.retryable || !this.eligible(record)) {
-      this.viewRecord(record, SERVER_STATES.failed, record.error);
+  /**
+   * Attach the status handle once an instance finishes activating.
+   *
+   * A mount that settles after this session moved on owns an orphan process, so it is disposed
+   * here instead of being left behind. Everything else subscribes and immediately reads the
+   * current status, which is what makes a first-attempt `waiting-authorization` or `reconnecting`
+   * visible without waiting for a transition that may never come.
+   */
+  attach(record, token, instance, handle) {
+    if (!this.current(record, token) || record.instance !== instance) {
+      void this.release(record, instance, { checkName: false });
       return;
     }
-    record.failures += 1;
-    const delay = retryDelay(record.failures, this.clock.random);
-    const token = record.token;
-    const at = this.clock.now() + delay;
-    record.timer = this.clock.setTimeout(() => {
-      record.timer = undefined;
-      void this.enqueue(() => this.current(record, token) ? this.retry(record) : undefined).catch(() => {});
-    }, delay);
-    this.viewRecord(record, SERVER_STATES.reconnecting, record.error, at);
-    // State transitions and entry into the slow lane, not an endless warning per attempt.
-    if (record.failures === 1 || record.failures === 7) this.logger.info(`workspace-mcp: ${record.name} reconnect scheduled (${record.failures === 7 ? 'slow' : 'initial'} backoff)`);
+    record.handle = handle;
+    record.unsubscribe = handle.onChange(status => this.nativeStatus(record, token, status));
+    this.nativeStatus(record, token, handle.current());
   }
-  async failed(record, failure) {
-    if (!this.current(record) || record.down) return;
+  /** Stop one instance where nothing would restart it: the native supervisor only runs while it lives. */
+  async stop(record, code) {
+    const instance = record.instance; record.instance = undefined;
     record.down = true;
-    // The reconnect supervisor owns the server from here; its own attempts are the probe.
     this.clock.clearTimeout(record.probeTimer); record.probeTimer = undefined;
-    record.probeFailures = 0;
-    if (record.connectedAt !== undefined && this.clock.now() - record.connectedAt >= STABLE_MS) record.failures = 0;
-    record.connectedAt = undefined;
-    record.error = failure.code; record.retryable = failure.retryable;
-    const boundary = record.boundary; record.boundary = undefined;
-    if (boundary) await this.closeBoundary(record, boundary);
+    if (instance !== undefined) await this.release(record, instance);
     if (!this.current(record)) return;
+    this.setView(record, { state: SERVER_STATES.failed, error: code });
     this.toolFilters.delete(record.name);
-    this.schedule(record);
-  }
-  async retry(record) {
-    if (!this.current(record)) return;
-    const signal = this.abort.signal;
-    let fresh;
-    try { fresh = await this.load(this.filesystem(), this.agent.session.header.cwd, this.config, { signal }); }
-    catch {
-      if (this.current(record)) { record.error = 'WORKSPACE_READ_FAILED'; this.schedule(record); }
-      return;
-    }
-    await this.refreshPolicy(fresh, signal);
-    if (!this.current(record)) return;
-    const entry = fresh.servers.find(item => item.spec.config.serverName === record.name);
-    if (!entry || !isDeepStrictEqual(entry, record.entry)) {
-      record.error = 'DECLARATION_CHANGED'; record.retryable = false;
-      this.viewRecord(record, SERVER_STATES.failed, record.error);
-      return; // Apply changed declarations at the existing safe assembly/editor boundary.
-    }
-    if (!this.eligible(record)) { this.viewRecord(record, SERVER_STATES.failed, record.error); return; }
-    // Only the decision is serialized. A slow remote initialize must not hold
-    // optional-MCP model requests or other servers' recovery behind its timeout.
-    const task = this.startRecord(record, signal, true).catch(() => {
-      this.logger.warn('workspace-mcp: recovery task failed (details redacted)');
-    }).finally(() => { this.background.delete(task); this.publish(); });
-    record.task = task;
-    this.background.add(task);
   }
   async startRecord(record, signal, automatic = false) {
     if (!this.current(record)) return;
     if (this.unsafeNames.has(record.name)) {
-      record.down = true; record.retryable = false; record.error = 'CLOSE_UNCONFIRMED';
-      this.viewRecord(record, SERVER_STATES.failed, record.error); return;
+      this.setView(record, { state: SERVER_STATES.failed, error: 'CLOSE_UNCONFIRMED' });
+      return;
     }
     record.down = false;
     record.autoAuthority = automatic || this.eligible(record);
     record.controller = new AbortController();
     const combined = AbortSignal.any([signal, this.abort.signal, record.controller.signal]);
     const token = ++record.token;
-    this.viewRecord(record, automatic ? SERVER_STATES.reconnecting : SERVER_STATES.pending);
+    this.setView(record, { state: automatic ? SERVER_STATES.reconnecting : SERVER_STATES.pending });
     try {
-      await this.connectionSlot(() => this.mount(this.group, record.entry.spec, combined, record, token), combined);
+      await this.connectionSlot(() => this.mount(record, combined, token), combined);
       combined.throwIfAborted();
-      if (!this.current(record, token) || record.down) return;
-      // A live profile can change while initialize waits. Never finish an automatic
+      if (!this.current(record, token)) return;
+      // A live profile can change while the first attempt runs. Never finish an automatic
       // connection under the permission snapshot captured before that wait.
       if (record.autoAuthority) {
         await this.refreshPolicy(this.plan, combined);
-        if (!this.current(record, token) || record.down) return;
-        if (!this.eligible(record)) {
-          record.down = false;
-          await this.failed(record, { code: 'AUTO_CONNECT_REVOKED', retryable: false }); return;
-        }
+        if (!this.current(record, token)) return;
+        if (!this.eligible(record)) { await this.stop(record, 'AUTO_CONNECT_REVOKED'); return; }
       }
-      record.connectedAt = this.clock.now(); record.error = undefined;
-      // A just-opened connection is its own confirmation.
-      record.lastVerifiedAt = record.connectedAt;
-      record.confirmed = true;
-      record.probeFailures = 0;
-      this.viewRecord(record, SERVER_STATES.connected);
-      this.scheduleHealth(record);
-      if (record.failures > 0) this.logger.info(`workspace-mcp: ${record.name} reconnected`);
+      this.publish();
     } catch (error) {
-      if (!this.current(record, token)) return;
-      await this.failed(record, error?.code === 'STARTUP_TIMEOUT'
-        ? { code: 'STARTUP_TIMEOUT', retryable: true } : classifyConnectionError(error));
+      const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{2,39}$/.test(error.code) ? error.code : 'START_FAILED';
+      const dead = error?.activationFailed === true || record.instance === undefined;
+      if (!this.current(record, token)) {
+        // Cancelled by a disposal or a replacement generation: end the instance, report nothing.
+        const instance = record.instance; record.instance = undefined;
+        if (instance !== undefined) await this.release(record, instance, { checkName: false });
+        return;
+      }
+      if (dead) {
+        // No supervisor is left to retry, so this row waits for a new declaration or a manual
+        // connect instead of pretending a retry is scheduled.
+        const instance = record.instance; record.instance = undefined;
+        if (instance !== undefined) await this.release(record, instance, { checkName: false });
+        record.down = true;
+        this.toolFilters.delete(record.name);
+        this.setView(record, { state: SERVER_STATES.failed, error: code, detail: error?.message });
+      } else {
+        // A startup timeout: the bridge is still trying and owns the retry, so the row only
+        // carries the code until the next status arrives.
+        this.setView(record, { error: code, detail: error?.message });
+      }
+      this.logger.warn(`workspace-mcp: ${record.name} ${code} (details redacted)`);
     }
   }
   async update(signal, beforeChange) {
@@ -989,10 +1028,8 @@ export class WorkspaceMcpSession {
     this.plan = plan;
     await this.refreshPolicy(plan, combined);
     for (const record of this.mounts.values()) {
-      if (record.timer !== undefined && !this.eligible(record)) {
-        this.clock.clearTimeout(record.timer); record.timer = undefined;
-        this.viewRecord(record, SERVER_STATES.failed, record.error);
-      } else if (record.down && record.retryable && record.timer === undefined && this.eligible(record)) this.schedule(record);
+      // A manual connect is legitimate while the policy allows nothing, so this loop only
+      // refreshes what the row reports; revoking authority is policyChanged's job.
       const live = this.serverStates.get(record.name);
       if (live?.reconnect) live.reconnect.eligible = this.eligible(record);
     }
@@ -1022,11 +1059,12 @@ export class WorkspaceMcpSession {
       await this.closeGroup(); this.loadedFingerprint = this.loadKey(plan); this.requiredFailure = false; return;
     }
     if (targets.some(entry => entry.spec.includeTools !== undefined || entry.spec.excludeTools !== undefined)) this.ensureGuard();
-    this.group ??= this.makeBoundary(this.agent.ctx);
     await mapLimit(targets, MOUNT_CONCURRENCY, async entry => {
       const name = entry.spec.config.serverName;
       if (this.mounts.has(name) || combined.aborted || this.closed) return;
-      const record = { name, entry, token: 0, failures: 0, stopped: false, down: false };
+      // One record per server for as long as its declaration is unchanged: the native
+      // supervisor keeps the connection alive, so a drop is a status change, not a new record.
+      const record = { name, entry, token: 0, stopped: false, down: false, confirmed: true, probeFailures: 0 };
       this.knownServers.add(name);
       this.mounts.set(name, record);
       await this.startRecord(record, combined);
@@ -1036,56 +1074,65 @@ export class WorkspaceMcpSession {
     this.requiredFailure = targets.some(entry => entry.spec.required && this.serverStates.get(entry.spec.config.serverName)?.state !== SERVER_STATES.connected);
     if (this.requiredFailure) throw new Error('workspace-mcp: required server failed to start');
   }
-  async mount(group, spec, signal, record, token) {
-    const name = spec.config.serverName;
-    // Even unsupported bridges keep the original secret-free logging boundary.
-    const redacted = () => safeLogger;
-    const safeLogger = Object.assign(redacted, Object.fromEntries(['warn', 'error', 'info', 'debug'].map(level =>
-      [level, () => this.logger[level](`workspace-mcp: native ${level} (${name}; details redacted)`)])));
-    const server = this.makeBoundary(group.ctx.extend({ logger: safeLogger }));
-    record.boundary = server;
-    const timeoutMs = spec.startupTimeoutMs ?? this.config.startupTimeoutMs ?? 15000;
-    let timer, cancel;
-    try {
-      if (spec.includeTools !== undefined || spec.excludeTools !== undefined) {
-        this.toolFilters.set(name, {
-          prefix: `mcp__${name}__`,
-          allow: spec.includeTools === undefined ? undefined : new Set(spec.includeTools.map(tool => publicToolName(name, tool))),
-          deny: new Set((spec.excludeTools ?? []).map(tool => publicToolName(name, tool))),
-        });
-      }
-      const plugin = this.monitoring ? createNativeAdapter(this.nativePlugin, {
-        serverName: name, logger: this.logger, onEvent: event => this.nativeEvent(record, token, event),
-      }) : this.nativePlugin;
-      const config = this.monitoring ? { ...spec.config, failOnStartupError: true, reconnect: { enabled: false } } : spec.config;
-      const fiber = server.ctx.plugin(plugin, config);
-      record.fiber = fiber;
-      const cancelled = new Promise((_, reject) => {
-        cancel = () => reject(signal.reason ?? new Error('cancelled'));
+  /**
+   * Mount one server through the bridge's own management host.
+   *
+   * The bridge starts the instance, owns its reconnect supervisor and publishes a typed status
+   * handle for it; this call only bounds the activation wait and publishes what the handle says.
+   * A mount that outlives its startup budget is *not* torn down: the supervisor may still be
+   * trying, and its next status update is more truthful than a timeout the panel already shows.
+   */
+  async mount(record, signal, token) {
+    const name = record.name;
+    const host = this.sessionHost();
+    if (host === undefined || typeof host.mount !== 'function') {
+      throw Object.assign(new Error('workspace-mcp: this Host does not publish an MCP client host'), { code: 'NATIVE_UNAVAILABLE' });
+    }
+    if (record.entry.spec.includeTools !== undefined || record.entry.spec.excludeTools !== undefined) {
+      this.toolFilters.set(name, {
+        prefix: `mcp__${name}__`,
+        // The bridge's loader is this declaration's transport, not one of its tools: an include
+        // list that does not name it must not make every tool behind it unreachable.
+        loader: (record.entry.spec.config.toolLoading ?? this.loadingMode()) === 'on-demand' ? loaderToolName(name) : undefined,
+        allow: record.entry.spec.includeTools === undefined ? undefined : new Set(record.entry.spec.includeTools.map(tool => publicToolName(name, tool))),
+        deny: new Set((record.entry.spec.excludeTools ?? []).map(tool => publicToolName(name, tool))),
+      });
+    }
+    const config = this.validateConfig(this.mountConfig(record.entry.spec), name);
+    const instance = host.mount(config);
+    record.instance = instance;
+    // Settle the instance's own activation in the background: whichever way this call ends,
+    // an activated instance must publish its status and an orphaned one must be disposed.
+    const ready = instance.ready;
+    void ready.then(handle => this.attach(record, token, instance, handle), () => {});
+    const budgetMs = (config.startupTimeoutMs ?? this.config.startupTimeoutMs ?? 15000) + NATIVE_STARTUP_GRACE_MS;
+    // The wait resolves instead of rejecting on every path. A rejected promise raised from
+    // inside a synchronous teardown is briefly unhandled, which the Host treats as fatal.
+    let cleanup = () => {};
+    const settled = await Promise.race([
+      ready.then(handle => ({ handle }), error => ({ error })),
+      new Promise(resolve => {
+        const timer = this.clock.setTimeout(() => resolve({ timeout: true }), budgetMs);
+        const cancel = () => resolve({ aborted: true });
         signal.addEventListener('abort', cancel, { once: true });
         if (signal.aborted) cancel();
-        timer = this.clock.setTimeout(() => reject(Object.assign(new Error('startup timeout'), { code: 'STARTUP_TIMEOUT' })), timeoutMs);
-      });
-      await Promise.race([fiber.await(), cancelled]);
-      // The cell is registered by the native apply; keep the handle for post-mortem closure checks.
-      record.status = this.nativeStatus(fiber);
-    } catch (error) {
-      record.status = this.nativeStatus(record.fiber) ?? record.status;
-      record.boundary = undefined;
-      await this.closeBoundary(record, server, token);
-      if (this.mounts.get(name) === record && record.token === token) this.toolFilters.delete(name);
-      throw error;
-    } finally {
-      this.clock.clearTimeout(timer);
-      if (cancel) signal.removeEventListener('abort', cancel);
-    }
+        cleanup = () => { this.clock.clearTimeout(timer); signal.removeEventListener('abort', cancel); };
+      }),
+    ]);
+    cleanup();
+    if (settled.handle !== undefined) return settled.handle;
+    if (settled.timeout === true) throw Object.assign(new Error('startup timeout'), { code: 'STARTUP_TIMEOUT' });
+    if (settled.aborted === true) throw Object.assign(new Error('mount cancelled'), { code: 'CANCELLED' });
+    // A rejected activation means the bridge fiber is gone: nothing will retry it, so the caller
+    // ends the instance and reports the failure.
+    throw Object.assign(settled.error, { activationFailed: true });
   }
+  /** End every mount of the current generation, keeping the session's host for the next one. */
   async closeGroup() {
-    const group = this.group; this.group = undefined;
-    for (const record of this.mounts.values()) this.cancelRecord(record);
-    await Promise.all([...this.mounts.values()].map(record => this.retire(record)));
+    const records = [...this.mounts.values()];
+    for (const record of records) this.cancelRecord(record);
+    await Promise.all(records.map(record => this.retire(record)));
     this.toolFilters.clear(); this.serverStates.clear(); this.requiredFailure = false;
-    if (group) await group.dispose();
   }
   /**
    * Test one declared server without touching its live mount.
@@ -1099,10 +1146,13 @@ export class WorkspaceMcpSession {
   async probe(serverId) {
     const entry = (this.plan?.servers ?? []).find(item => item.spec.config.serverName === serverId);
     if (entry === undefined) throw Object.assign(new Error('workspace-mcp: no such declared server'), { code: 'UNKNOWN_SERVER' });
-    const host = this.probeHost();
-    if (host === undefined) throw Object.assign(new Error('workspace-mcp: the loaded MCP bridge cannot probe servers'), { code: 'PROBE_UNSUPPORTED' });
+    const host = this.sessionHost();
+    if (host === undefined || typeof host.probe !== 'function') {
+      throw Object.assign(new Error('workspace-mcp: the loaded MCP bridge cannot probe servers'), { code: 'PROBE_UNSUPPORTED' });
+    }
+    const config = this.validateConfig(this.mountConfig(entry.spec), serverId);
     this.noteActivity();
-    const outcome = await host.probe(entry.spec.config, { timeoutMs: this.config.probeTimeoutMs ?? 10000 });
+    const outcome = await host.probe(config, { timeoutMs: this.config.probeTimeoutMs ?? 10000 });
     // The probe is the only MCP-level evidence available on demand, so let it settle this
     // row's confidence. A success confirms the session; a failure only withholds the green
     // claim, because a short budget or a busy server is not proof that the live mount died.
@@ -1112,39 +1162,83 @@ export class WorkspaceMcpSession {
         record.confirmed = true;
         record.probeFailures = 0;
         record.lastVerifiedAt = this.clock.now();
-        this.viewRecord(record, SERVER_STATES.connected);
+        this.setView(record, { state: SERVER_STATES.connected, tools: this.toolNamesFor(serverId) });
       } else if (record.confirmed !== false) {
         record.confirmed = false;
-        this.viewRecord(record, SERVER_STATES.connected);
+        this.setView(record, { state: SERVER_STATES.connected, tools: this.toolNamesFor(serverId) });
       }
     }
     return outcome;
   }
-  /**
-   * Resolve the bridge's management host, `ctx.mcpClientHost`.
-   *
-   * The bridge no longer exports a module-level `probeServer`; probing is available through the host a
-   * managing plugin owns. Reuse a host the composition already provides, otherwise create one below this
-   * session's owner context so probes end with the plugin.
-   * @returns the host, or undefined when the loaded bridge predates `McpClientHost`.
-   */
-  probeHost() {
-    if (this.probeHostRef !== undefined) return this.probeHostRef;
-    let provided;
-    try { provided = this.scopeOwner?.get?.('mcpClientHost'); } catch { provided = undefined; }
-    if (provided !== undefined) return (this.probeHostRef = provided);
-    const HostClass = this.nativePlugin?.McpClientHost;
-    if (typeof HostClass === 'function') return (this.probeHostRef = new HostClass(this.scopeOwner));
-    // Bridges before 0.2.3 expose the one-shot probe as a module function instead.
-    const legacy = this.nativePlugin?.probeServer;
-    if (typeof legacy === 'function') {
-      return (this.probeHostRef = {
-        probe: (config, options) => legacy.call(this.nativePlugin, this.scopeOwner, config, options),
-      });
-    }
-    return undefined;
+  /** The browser-authorization attempt of one server, as the panel may show it. */
+  authorizationView(serverId) {
+    const view = this.authOwners.get(serverId)?.owner.current();
+    if (view === undefined) return undefined;
+    return {
+      id: view.id,
+      phase: view.phase,
+      reason: this.serverStates.get(serverId)?.authorization?.reason,
+      lastError: view.lastError,
+      // Handed to the browser as-is; it is the authorization server's own page.
+      ...(view.authorizationUrl === undefined ? {} : { authorizationUrl: view.authorizationUrl }),
+    };
   }
-
+  /**
+   * The authorization owner of one server, created on first use and replaced when its
+   * configuration changes, because an owner is bound to one endpoint, client and scope.
+   */
+  authorizationOwner(serverId, config, host) {
+    const fingerprint = JSON.stringify([config.url, config.oauth]);
+    const existing = this.authOwners.get(serverId);
+    if (existing !== undefined && existing.fingerprint === fingerprint) return existing.owner;
+    if (existing !== undefined) void existing.owner.dispose();
+    const owner = host.authorization(config, () => {
+      const record = this.mounts.get(serverId);
+      if (record !== undefined) this.setView(record, {});
+      else this.publish();
+    });
+    this.authOwners.set(serverId, { fingerprint, owner });
+    return owner;
+  }
+  /**
+   * Start (or resume) browser authorization for one declared server.
+   *
+   * The bridge's owner registers the callback route, opens the flow and publishes the attempt
+   * phase, so this plugin only has to name the server, hand the URL to the panel and let the
+   * credential update reconnect the live mount on its own.
+   */
+  async authorize(serverId) {
+    const entry = (this.plan?.servers ?? []).find(item => item.spec.config.serverName === serverId);
+    if (entry === undefined) throw Object.assign(new Error('workspace-mcp: no such declared server'), { code: 'UNKNOWN_SERVER' });
+    const host = this.sessionHost();
+    if (host === undefined || typeof host.authorization !== 'function') {
+      throw Object.assign(new Error('workspace-mcp: the loaded MCP bridge cannot authorize servers'), { code: 'OAUTH_UNSUPPORTED' });
+    }
+    const config = this.validateConfig(this.mountConfig(entry.spec), serverId);
+    if (config.transport !== 'streamable-http' || config.oauth === undefined) {
+      throw Object.assign(new Error('workspace-mcp: this server is not declared for browser authorization'), { code: 'OAUTH_UNSUPPORTED' });
+    }
+    this.noteActivity();
+    // The attempt itself travels through the owner's change callback, so the answer is just the
+    // refreshed view: its row carries the phase and the page to open.
+    await this.authorizationOwner(serverId, config, host).start();
+    const record = this.mounts.get(serverId);
+    if (record !== undefined) this.setView(record, {});
+    else this.publish();
+    return this.status(undefined);
+  }
+  /** Cancel the active authorization attempt of one server, leaving its grant untouched. */
+  async cancelAuthorization(serverId) {
+    const owner = this.authOwners.get(serverId)?.owner;
+    const view = owner?.current();
+    if (owner !== undefined && view !== undefined) await owner.cancel(view.id);
+    this.publish();
+    return this.status(undefined);
+  }
+  /** Retire every authorization owner; their callback routes must not outlive the session. */
+  async disposeAuthorizations() {
+    await Promise.all([...this.authOwners.keys()].map(name => this.retireAuthorization(name)));
+  }
   /** Model-facing tool names this server currently publishes in the Agent scope. */
   toolNamesFor(serverName) {
     const prefix = `mcp__${serverName}__`;
@@ -1153,7 +1247,9 @@ export class WorkspaceMcpSession {
   }
   dispose() {
     if (this.disposing) return this.disposing;
-    this.closed = true; this.abort.abort(new Error('workspace MCP owner disposed'));
+    this.closed = true;
+    try { this.abort.abort(); }
+    catch { /* a throwing abort listener is not a teardown failure */ }
     // Release held waiters instead of leaving them to their timeout: the session is gone and
     // their next wait will be answered with SESSION_NOT_READY.
     this.release();
@@ -1164,64 +1260,25 @@ export class WorkspaceMcpSession {
       await this.closeGroup(); await this.queue;
       await Promise.allSettled([...this.background]);
       await this.closeGroup();
+      // Authorization owners own callback routes and flows, so they end here rather than with
+      // the last mount: a pending attempt has to be withdrawn.
+      await this.disposeAuthorizations().catch(() => {});
+      const boundary = this.group; this.group = undefined;
+      if (boundary) await Promise.resolve(boundary.dispose()).catch(() => {});
     })();
     return this.disposing;
   }
-}
-
-/**
- * Read the native bridge's own version through the Host loader.
- *
- * The loader exposes two different import paths and only one of them can carry JSON
- * attributes, so every reasonable spelling is tried before giving up. Returning `null`
- * means "unknown", which the capability check then decides — it never means "unsupported".
- * @returns the version string, or null when no route produced one.
- */
-async function detectNativeVersion(loader, logger) {
-  const pkg = '@deepseek-ai/dsh-mcp-client/package.json';
-  const versionOf = value => (value?.default ?? value)?.version;
-  const read = async run => {
-    const version = versionOf(await run());
-    return typeof version === 'string' && version.length > 0 ? version : undefined;
-  };
-  const attempts = [];
-  const tryRead = async run => {
-    try { return await read(run); }
-    catch (error) { attempts.push(typeof error?.code === 'string' ? error.code : 'IMPORT_FAILED'); return undefined; }
-  };
-  const baseUrl = loader?.ctx?.baseUrl;
-  const internal = loader?.internal;
-  if (internal !== undefined) {
-    // Node's internal loader takes attributes directly; both spellings have shipped.
-    for (const attributes of [{ type: 'json' }, { with: { type: 'json' } }]) {
-      const version = await tryRead(() => internal.import(pkg, baseUrl, attributes));
-      if (version !== undefined) return version;
-    }
-  }
-  const version = await tryRead(() => loader.import(pkg));
-  if (version !== undefined) return version;
-  logger?.warn?.(`workspace-mcp: native bridge metadata unavailable (${[...new Set(attempts)].join(',') || 'NO_LOADER'}); verifying capabilities instead`);
-  return null;
 }
 
 export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
   if (config.enabled === false) return;
   const nativePlugin = dependencies.nativePlugin
     ?? await loadNativeBridge(ctx, dependencies.resolveLoader);
-  let nativeVersion = dependencies.nativeVersion;
-  if (nativeVersion === undefined && !dependencies.nativePlugin) {
-    let loader;
-    try { loader = dependencies.resolveLoader?.() ?? ctx.get('loader'); } catch { loader = undefined; }
-    nativeVersion = loader === undefined ? null : await detectNativeVersion(loader, ctx.logger);
-  }
-  if (nativeVersion === undefined) nativeVersion = '0.2.0-rc.2'; // Explicit test/integration bridge.
-  const support = nativeBridgeSupport(nativePlugin, nativeVersion);
-  if (support === undefined) {
-    ctx.logger.warn(`workspace-mcp: native bridge cannot be adapted (version ${String(nativeVersion)}); enhanced reconnect disabled`);
-  } else if (support === 'capabilities') {
-    // Say it out loud once: disconnect wording is the one thing not verified here, so the
-    // version-independent detection (probes, typed request errors) is what carries this case.
-    ctx.logger.warn(`workspace-mcp: native bridge version ${String(nativeVersion)} unverified; capabilities confirmed, monitoring enabled`);
+  // No version probe and no export guessing: the bridge publishes `McpClientHost` for exactly
+  // this job, so its presence is the whole capability question. A Host without it is reported
+  // once here and left unconfigured rather than half-supported.
+  if (typeof nativePlugin?.McpClientHost !== 'function') {
+    ctx.logger.warn('workspace-mcp: the loaded MCP client does not publish ctx.mcpClientHost; workspace MCP is disabled');
   }
   const sessions = new Map();
   let stopping = false;
@@ -1229,7 +1286,7 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
     if (stopping) return undefined;
     let state = sessions.get(agent);
     if (!state) {
-      state = new WorkspaceMcpSession(agent, config, { logger: ctx.logger, scopeOwner: ctx, ...dependencies, nativePlugin, nativeVersion });
+      state = new WorkspaceMcpSession(agent, config, { logger: ctx.logger, scopeOwner: ctx, ...dependencies, nativePlugin });
       sessions.set(agent, state);
       // Both Agent disposal and plugin unload own the same idempotent teardown.
       agent.ctx.effect(() => () => { sessions.delete(agent); return state.dispose(); }, 'workspace-mcp.agent');
@@ -1256,37 +1313,6 @@ export async function installWorkspaceLoader(ctx, config, dependencies = {}) {
     await state.reconcile(signal);
     signal?.throwIfAborted();
   });
-  // Base providers run synchronously before any assembly middleware. Capture
-  // the actual registry generation here, not an already-filtered prompt later.
-  const frames = new WeakMap();
-  ctx.systemPrompt.tools(context => {
-    const state = sessions.get(context.agent ?? context.scope);
-    if (state) frames.set(context, state.assemblyFrame());
-    return { schemas: [] };
-  });
-  // Assembly runs before `agent/pre-step`, so loading here makes the current
-  // model request see the change instead of waiting a turn.
-  ctx.on('system-prompt/assemble', async (assembly, context, next) => {
-    const agent = context.agent ?? context.scope;
-    if (!agent || ctx.agents.get(agent.id) !== agent) return next();
-    // 0.2.2's waterfall has no tools. Native providers own schemas (including
-    // PTC/executor projections); leave the already admitted snapshot untouched.
-    // Older Hosts still need the legacy delta refresh below.
-    if (!Array.isArray(assembly.tools)) return next();
-    const state = attach(agent);
-    if (!state) return next();
-    // A model request is the moment the tool set is about to be used: keep the heartbeat
-    // warm here. The probe itself stays off this path so assembly never waits on a socket.
-    state.noteActivity();
-    const frame = frames.get(context) ?? state.assemblyFrame();
-    // Background recovery may move the registry after the Host's initial snapshot.
-    // Compare against that raw frame while retaining upstream visibility filters.
-    await state.reconcile(context.signal);
-    const fresh = await baseAssembly(state.scopeOwner, context);
-    state.refreshAssembly(assembly, frame, fresh);
-    // Do not recurse through assemble middleware: each unrelated listener runs exactly once.
-    return next();
-  }, { prepend: true });
   // Existing sessions load at their next safe model-step boundary, never during a tool call.
   for (const agent of ctx.agents.list()) attach(agent);
   return {

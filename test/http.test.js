@@ -7,10 +7,15 @@ import WebServer from '@deepseek-ai/dsh-host-webserver';
 /** Start the real host web server on an OS-assigned port and serve the shell index. */
 async function startServer(t, ctx) {
   await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 });
-  ctx.webServer.registerFallback((_req, res) => {
-    const html = ctx.webServer.renderIndex('<html><head><title>t</title></head><body></body></html>');
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(html);
+  // The shell is served to anyone in this fixture: 0.2.3 makes an unauthenticated fallback a
+  // 503, so the anonymous rule is explicit here exactly as the app's own composition does it.
+  ctx.webServer.registerFallback({
+    auth: 'anonymous',
+    handler: (_req, res) => {
+      const html = ctx.webServer.renderIndex('<html><head><title>t</title></head><body></body></html>');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(html);
+    },
   });
   return `http://127.0.0.1:${ctx.webServer.port}`;
 }
@@ -28,7 +33,7 @@ test('the management route works over real HTTP: token injection, status, connec
   const base = await startServer(t, ctx);
   const agentA = agent(ctx, dir, 'http-session');
   ctx.agents.enter(agentA, undefined);
-  await ctx.plugin(Plugin, { trustMode: 'manual' });
+  await ctx.plugin(Plugin, { trustMode: 'manual', toolLoading: 'eager' });
 
   const index = await get(`${base}/`);
   assert.equal(index.status, 200);
@@ -94,7 +99,7 @@ test('the declaration route lists, edits and removes a project file over real HT
   const base = await startServer(t, ctx);
   const agentA = agent(ctx, dir, 'declaration-session');
   ctx.agents.enter(agentA, undefined);
-  await ctx.plugin(Plugin, { trustMode: 'all' });
+  await ctx.plugin(Plugin, { trustMode: 'all', toolLoading: 'eager' });
 
   const index = await get(`${base}/`);
   const token = /window\.__WORKSPACE_MCP_TOKEN__="([0-9a-f]{48})"/.exec(index.text)?.[1];
@@ -150,7 +155,7 @@ test('TOML allowLossy crosses HTTP, control and runtime for save, append, remove
   await writeFixture(dir, '.codex/config.toml', source);
   const base = await startServer(t, ctx);
   ctx.agents.enter(agent(ctx, dir, 'toml-session'), undefined);
-  await ctx.plugin(Plugin, { trustMode: 'manual' });
+  await ctx.plugin(Plugin, { trustMode: 'manual', toolLoading: 'eager' });
   const token = /window\.__WORKSPACE_MCP_TOKEN__="([0-9a-f]{48})"/.exec((await get(`${base}/`)).text)?.[1];
   const headers = { 'content-type': 'application/json', 'x-workspace-mcp-token': token };
   const post = async body => {
@@ -199,7 +204,7 @@ test('nested under another fiber the route still registers', { timeout: 30000 },
   // can reach it; a bare `ctx.get('webServer')` silently returned undefined there.
   const host = ctx.plugin({
     name: 'test-host',
-    apply(inner) { inner.plugin(Plugin, { trustMode: 'manual' }); },
+    apply(inner) { inner.plugin(Plugin, { trustMode: 'manual', toolLoading: 'eager' }); },
   });
   await host;
   await host.await();

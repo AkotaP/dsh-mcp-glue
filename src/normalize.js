@@ -70,6 +70,59 @@ const positive = (v, code, field) => {
   return v;
 };
 
+/**
+ * Credential-record address for an OAuth server that does not name one.
+ *
+ * The native credential store keys a grant by this string, so it has to stay stable across
+ * reloads and unique across endpoints: the server name alone would let two workspaces that
+ * declare the same name share (and overwrite) one grant, while the endpoint digest keeps them
+ * apart and makes a moved endpoint ask for authorization again instead of reusing a stale grant.
+ */
+export function derivedCredentialKey(serverName, url) {
+  return `mcp-client/workspace-mcp/${serverName}-${createHash('sha256').update(url).digest('hex').slice(0, 8)}`;
+}
+
+const OAUTH_KEYS = new Set(['credentialKey', 'clientId', 'scope', 'requestTimeoutMs', 'authorizationTimeoutMs']);
+
+/**
+ * Normalize the `oauth` field of an HTTP server.
+ *
+ * `true` is the shorthand for "browser authorization with defaults": dynamic client
+ * registration, no requested scope, and a derived credential key. An object narrows that with
+ * the native options. Only Streamable HTTP can carry a grant, and a declared Authorization
+ * header means the caller already chose header authentication, so the two never combine.
+ */
+function oauthOf(raw, serverName, url, headers) {
+  if (raw === undefined || raw === false) return undefined;
+  const value = raw === true ? {} : raw;
+  if (!isRecord(value)) fail('INVALID_OAUTH', 'oauth 必须是 true 或一个对象');
+  for (const key of Object.keys(value)) if (!OAUTH_KEYS.has(key)) fail('INVALID_OAUTH', `oauth 不支持字段 ${key}；可用 ${[...OAUTH_KEYS].join(' / ')}`);
+  if (Object.keys(headers ?? {}).some(name => name.toLowerCase() === 'authorization')) {
+    fail('CONFLICTING_AUTH_HEADERS', '声明了 oauth 就不能同时用 Authorization 头（bearer_token_env_var 也算）：浏览器授权会自己换取令牌');
+  }
+  const credentialKey = value.credentialKey ?? derivedCredentialKey(serverName, url);
+  if (typeof credentialKey !== 'string' || !/^mcp-client\/\S+$/.test(credentialKey)) fail('INVALID_OAUTH', 'oauth.credentialKey 必须是 "mcp-client/..." 形式的凭据地址');
+  const budget = (amount, name) => {
+    if (amount === undefined) return undefined;
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0 || amount > 2147483647) fail('INVALID_OAUTH', `oauth.${name} 必须是正的有限数`);
+    return amount;
+  };
+  const oauth = { credentialKey };
+  if (value.clientId !== undefined) {
+    if (!string(value.clientId)) fail('INVALID_OAUTH', 'oauth.clientId 必须是非空字符串');
+    oauth.clientId = value.clientId;
+  }
+  if (value.scope !== undefined) {
+    if (typeof value.scope !== 'string') fail('INVALID_OAUTH', 'oauth.scope 必须是字符串');
+    oauth.scope = value.scope;
+  }
+  const requestTimeoutMs = budget(value.requestTimeoutMs, 'requestTimeoutMs');
+  if (requestTimeoutMs !== undefined) oauth.requestTimeoutMs = requestTimeoutMs;
+  const authorizationTimeoutMs = budget(value.authorizationTimeoutMs, 'authorizationTimeoutMs');
+  if (authorizationTimeoutMs !== undefined) oauth.authorizationTimeoutMs = authorizationTimeoutMs;
+  return oauth;
+}
+
 /** Convert supported semantics only. Unsupported security/auth fields fail closed. */
 export function normalizeServer(rawName, raw, preset, context, fileEnv = {}) {
   if (!isRecord(raw)) fail('INVALID_SERVER', `${rawName} 的条目必须是一个对象`);
@@ -78,8 +131,10 @@ export function normalizeServer(rawName, raw, preset, context, fileEnv = {}) {
     ? undefined : select(raw, fields[key]);
   for (const key of ['enabled', 'disabled']) if (get(key) !== undefined && typeof get(key) !== 'boolean') fail('INVALID_ENABLED_FLAG', `${fields[key]} 必须是布尔值`);
   if (get('enabled') === false || get('disabled') === true) return undefined;
-  // These fields change authentication, execution location, or security policy.
-  for (const key of ['oauth', 'auth', 'authProviderType', 'headersHelper', 'http_headers_helper', 'experimental_environment', 'default_tools_approval_mode', 'tools']) {
+  // These fields change authentication, execution location, or security policy. `oauth` is
+  // supported below through the native host's own authorization owner, so it is not refused here;
+  // the shapes it does accept are spelled out in `oauthOf`.
+  for (const key of ['auth', 'authProviderType', 'headersHelper', 'http_headers_helper', 'experimental_environment', 'default_tools_approval_mode', 'tools']) {
     if (Object.hasOwn(raw, key)) fail('UNSUPPORTED_AUTH_OR_POLICY', `字段 ${key} 会改变鉴权、执行位置或安全策略，插件不会静默降级，请手动移除或改用受支持的写法`);
   }
   if (raw.sandboxEnabled === true || Object.hasOwn(raw, 'sandbox')) fail('UNSUPPORTED_SANDBOX', '服务器级 sandbox 策略暂不支持');
@@ -98,6 +153,9 @@ export function normalizeServer(rawName, raw, preset, context, fileEnv = {}) {
   if (get('timeoutMs') !== undefined) config.toolCallTimeoutMs = positive(get('timeoutMs'), 'INVALID_TIMEOUT', fields.timeoutMs);
   else if (get('timeoutSeconds') !== undefined) config.toolCallTimeoutMs = positive(get('timeoutSeconds') * 1000, 'INVALID_TIMEOUT', fields.timeoutSeconds);
   else if (preset.dialect === 'gemini') config.toolCallTimeoutMs = 600000;
+  if (raw.oauth !== undefined && raw.oauth !== false && transport !== 'streamable-http') {
+    fail('INVALID_OAUTH', 'oauth 只适用于 streamable-http 远程端点；stdio 本地进程没有授权服务器');
+  }
   if (transport === 'stdio') {
     if (!string(get('command')) || get('url') !== undefined || (preset.dialect === 'gemini' && raw.url !== undefined)) fail('AMBIGUOUS_TRANSPORT', 'command 与 url 只能声明一个：它们分别代表本地进程和远程端点');
     config.command = expand(get('command'));
@@ -141,10 +199,24 @@ export function normalizeServer(rawName, raw, preset, context, fileEnv = {}) {
     }
     const invalidHeader = Object.entries(config.headers).find(([k, v]) => !/^[!#$%&'*+.^`|~0-9A-Za-z-]+$/.test(k) || /[\r\n\0]/.test(v));
     if (invalidHeader !== undefined) fail('INVALID_HEADERS', `头 ${invalidHeader[0]} 的名称或值不合法`);
+    const oauth = oauthOf(raw.oauth, serverName, config.url, config.headers);
+    if (oauth !== undefined) config.oauth = oauth;
   }
   const includeTools = list(preset.dialect === 'codex' ? raw.enabled_tools : raw.includeTools, 'INVALID_TOOL_FILTER', preset.dialect === 'codex' ? 'enabled_tools' : 'includeTools');
   const excludeTools = list(preset.dialect === 'codex' ? raw.disabled_tools : raw.excludeTools, 'INVALID_TOOL_FILTER', preset.dialect === 'codex' ? 'disabled_tools' : 'excludeTools');
   if (raw.required !== undefined && typeof raw.required !== 'boolean') fail('INVALID_REQUIRED', 'required 必须是布尔值');
+  // Plugin-specific, not part of any dialect: the new Host can list a server's tools for the
+  // agent to load instead of registering all of them up front, which is what keeps a workspace
+  // with many servers from spending its whole prompt budget on tool schemas.
+  if (raw.toolLoading !== undefined) {
+    if (raw.toolLoading !== 'eager' && raw.toolLoading !== 'on-demand') fail('INVALID_TOOL_LOADING', 'toolLoading 只能是 eager 或 on-demand');
+    config.toolLoading = raw.toolLoading;
+  }
+  if (raw.catalogDescriptionMaxLength !== undefined) {
+    const value = raw.catalogDescriptionMaxLength;
+    if (!Number.isSafeInteger(value) || value < 4 || value > 4096) fail('INVALID_CATALOG_DESCRIPTION', 'catalogDescriptionMaxLength 必须是 4 到 4096 之间的整数');
+    config.catalogDescriptionMaxLength = value;
+  }
   const startupTimeoutMs = raw.startup_timeout_sec !== undefined ? positive(raw.startup_timeout_sec * 1000, 'INVALID_TIMEOUT', 'startup_timeout_sec') : undefined;
   const credentialRefs = new Set();
   const inputRefs = new Set();
@@ -166,7 +238,10 @@ export function normalizeServer(rawName, raw, preset, context, fileEnv = {}) {
   const endpoint = typeof originalUrl === 'string' ? originalUrl.match(/^https?:\/\/[^/?#]+/i)?.[0] ?? '[templated endpoint; inspect declaration]' : undefined;
   const approval = { command: get('command'), argumentCount: config.args?.length,
     cwd: get('cwd') ?? '[workspace]', endpoint, environmentKeys: Object.keys(config.env ?? {}),
-    credentialRefs: [...credentialRefs].sort(), inputRefs: [...inputRefs].sort() };
+    credentialRefs: [...credentialRefs].sort(), inputRefs: [...inputRefs].sort(),
+    // Browser authorization is a new kind of access this declaration asks for, so the panel
+    // shows it before anything starts rather than after a grant appears in the credential store.
+    oauth: config.oauth !== undefined, toolLoading: config.toolLoading ?? null };
   return { config, includeTools, excludeTools, startupTimeoutMs, required: raw.required === true, approval };
 }
 export function normalizeServerName(name) {
@@ -176,6 +251,10 @@ export function normalizeServerName(name) {
   const base = name.replace(/[^A-Za-z0-9_-]/g, '_').replace(/_+/g, '_').slice(0, 19).replace(/_+$/, '');
   return `${base}_${createHash('sha256').update(name).digest('hex').slice(0, 12)}`;
 }
+/** Raw name of the bridge's own `on-demand` loader inside a server's tool namespace. */
+export const LOADER_TOOL = 'load_tools';
+/** The loader's public name, which a project's tool filter must never be able to disable. */
+export function loaderToolName(serverName) { return publicToolName(serverName, LOADER_TOOL); }
 /** Match the verified native dsh-mcp-client v0.2.0-rc.2 naming invariant. */
 export function publicToolName(serverName, rawName) {
   const joined = `mcp__${serverName}__${rawName}`;

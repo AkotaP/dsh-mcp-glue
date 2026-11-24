@@ -14,7 +14,7 @@
 - 未展开时是一枚 chip：`● MCP 已连接数/声明数`（无声明时只显示 `MCP`）。**点的颜色跟随面板里的行，按严重级取最高**（`chipSummary`，[src/client.js](../src/client.js)）：
   1. 控制通道请求失败 → 红（此时一行数据都没有）；
   2. 否则面板里只要有**红**行（`failed` 启动失败 / `invalid` 声明非法）→ 红；
-  3. 否则只要有**黄 / 琥珀色**行（`unauthorized` 没有任何一层授权它 / `unloaded` 未连接 / `reconnecting` 退避重连）→ 黄；
+  3. 否则只要有**黄 / 琥珀色**行（`unauthorized` 没有任何一层授权它 / `authorization` 等浏览器授权 / `unloaded` 未连接 / `reconnecting` 退避重连）→ 黄；
   4. 只有**所有行都是绿**（`connected`）→ 绿；
   5. 其余保持中性**灰**：没有声明、还没读到、或行处于中间态（如挂载瞬间的 `pending`）。
   红色表示"这一代有问题"，只有第 1 条是"控制通道本身不可达"。
@@ -66,31 +66,51 @@
 - `断开` 是**粘性**的：即使声明文件之后变化，被用户关掉的服务器也不会自己回来。手动选择不持久化——重启或换会话后又回到策略判定。
 - `恢复自动`（`POST /follow`）= 丢掉手动选择，回到完全按三层策略判定。
 - `允许一个工具`（展开行里的工具开关）= 把 `mcp__<server>__<tool>` 写进 `allowTools`；它与连接无关，只影响工具调用是否需要放行。
-- 一次「连接」在**下一条消息**生效：工具集在每次模型请求组装时确定，正在进行的回合不会中途换工具。
+- 一次「连接」在**下一次工具准入**（`ctx.tools.resolve`，模型请求组装前）生效：正在进行的回合不会中途换工具。
 - 逐台切换、单台失败恢复与正常声明更新都按**每台服务器的 spec / 来源差异**协调：只卸载移除、改动或明确重试的失败服务器，保留未变化的健康同伴及其子 fiber，不再整组重启。
 
-<a id="auto-reconnect"></a>
+<a id="connection-states"></a>
 
-## 自动重连（Auto reconnect）
+## 四、连接状态与授权（0.2.3）
 
-- **范围与授权**：只有本插件挂载、当前 `selected` 且策略仍 `autoAllowed` 的服务器可自动重试，还须通过原生版本与接口验证。`selectionMode: custom` 本身不禁用重连；手动选中的服务器只要策略仍允许就有资格。策略未允许的手动连接是 single-shot，失败后须用户再次连接。`断开 / 停止连接` 取消重试与进行中的初始化，粘性选择不会被后台任务或声明变化推翻；取消自动连接授权也会撤销重试资格。
-- **兼容边界（按能力准入）**：通过宿主 Cordis loader 获取同一原生模块实例，并尽力读取其 `package.json` 版本（内部 loader 的两种 JSON 属性写法、再退回普通 import）。**版本号不是门槛**：`0.2.0-rc.2` 与 `0.2.1-rc.2` 是读过生命周期措辞、按版本信任的版本；其余版本（含元数据读不到）只要仍满足两项能力——`Config` 接受 `reconnect`、导出 `createMcpToolDefinition`——就启用监控，并在日志写明「版本未核实、能力已确认」。只有形状或能力不满足才 `monitoring: 'unsupported'`，宿主警告且面板提示「增强重连与断线监控不可用」，回退原生连接。这样宿主例行升级不会静默关掉全部增强功能（0.2.1 升级时正是如此，已修）。已验证模式关闭原生自身的 reconnect，由插件统一监督，避免两套重试叠加。
-- **退避**：基准间隔为 **1、2、4、8、16、30、60 秒**，每次乘 **0.8～1** 的随机抖动；没有总尝试上限，后续始终用 60 秒档（实际 48～60 秒）。短暂接通不重置次数：连接至少稳定 **30 秒**后再次失败才从首档开始。模型请求不会跳过已有退避或重新启动失败记录；用户「立即重试」是显式单台重试入口，不重启健康同伴。首次启动与后台恢复共享每会话最多 6 个连接名额；后台初始化不占模型请求队列，可选 MCP 握手缓慢不会阻塞正常对话，等待名额的任务也可立即取消。
-- **状态与操作**：`reconnecting` 为琥珀色，既包括等待重试也包括自动初始化中。行携带 `reconnect: { eligible, attempt, nextRetryAt, reason }`；有 `nextRetryAt` 时客户端每秒**本地**更新倒计时与次数，不为倒计时额外读状态或请求 MCP。`pending / reconnecting` 提供「停止连接」，`pending / reconnecting / failed` 提供「立即重试」（处理中或 `CLOSE_UNCONFIRMED` 时禁用）。失败行仍显示有界错误码，chip 仍按红 > 黄 > 中性 / 全绿取色。
-- **required 故障**：已选 `required` 服务器启动失败或断线时，模型请求持续拒绝，直到它恢复；不会因重试请求而绕过退避，也不会卸载健康同伴。未授权且未选中的服务器不是 outage。非法 `required` 声明仍按原有 fail-closed 校验拒绝，不等同于单台运行时断线。
-- **暂停与安全锁**：非法声明不进入重试；永久鉴权问题（如 401 / 403）与永久启动错误（如 `ENOENT / EACCES / EPERM`）暂停，修复后显式重试 / 安全协调。一般启动错误、网络故障、启动超时等瞬时错误仍自动退避。若无法确认旧进程 / transport 关闭，记为 `CLOSE_UNCONFIRMED`，当前会话对该服务器名停止一切重连，**手动连接也不能绕过**；必须换会话或实际重启宿主，不能仅点「立即重试」。
-- **声明更新边界**：每次后台重试重读声明和授权；目标条目消失或发生变化时停止并报 `DECLARATION_CHANGED`，不在后台直接启动新声明。等下一次安全的模型组装 / 编辑协调，再按逐服务器差异应用，未变化的健康连接保留。
-- **原生状态接口优先（0.2.2+）**：0.2.2 起原生桥接发布按 Fiber 键控的状态单元（`connectionStatusOf(fiber)`），插件改为订阅它：断线、重连、失败原因（`reconnect-disabled` / `gave-up` / `unclosed-generation`）与清理结果（`closure()`）直接来自原生状态机，`unclosed-generation` 立即标记 `CLOSE_UNCONFIRMED` 并禁止重生。**一旦订阅成功，生命周期日志文本就不再参与判断**——单一事实来源，措辞漂移最多是失去兜底，绝不会叠加出重复事件；只有没有该接口的旧版本才走文本兜底（0.2.2 把关闭失败改说 `cleanup incomplete`，文本路径已同步识别）。关闭确认读 `closure()`，不再依赖日志。
-- **测试连接**：每行提供「测试」（完整名称在 tooltip 与无障碍标签里），经 `ctx.mcpClientHost.probe()` 做一次真实 MCP 握手与工具列举（0.2.3 起原生桥不再导出模块级 `probeServer`，旧宿主由插件自建兜底）（stdio / HTTP 均可），不注册工具、不占用服务器名、不触碰现有连接；结果在行下显示服务器身份、工具数与耗时，失败时显示阶段与消息。它同时**结算该行的可信度**：成功即视为 MCP 级确认（绿点恢复并刷新 `lastVerifiedAt`），失败只撤绿、**不拆连接**（探测预算短或服务忙都不等于现有连接已死）。它与下面的只读可达性探测是两回事：探测回答「还有东西在听吗」，测试连接回答「握手和工具列表能不能走通」。
-- **断线感知与快速反馈**：原生桥接只在自身 transport 报出关闭时才知道断线，因此被关掉的 HTTP 服务可能一直显示绿的，直到某次调用失败。插件因此补了一层**只读可达性探测**（`src/health.js`），并且**状态本身不再撒谎**：
-  - **诚实状态**：`connected` 行额外带 `verified` 与 `lastVerifiedAt`。HTTP 行超过两个探测周期没有确认时，本地（**零网络**）即撤下绿点，显示灰点「待确认」与「上次确认：N 秒前」，chip 随之转琥珀。`stdio` 行不做此降级——子进程退出本来就会变成事件。
-  - **探测方式**：只对 `streamable-http` 且已连接的行；`HEAD` 请求，**1.5 秒**超时，**不带任何凭据**，`redirect: 'manual'`；**任何 HTTP 响应都算存活**（401/404/405 恰恰证明服务在监听），只有网络层错误（`ECONNREFUSED`/`ECONNRESET`/`ETIMEDOUT`/`ENOTFOUND`/`EHOSTUNREACH` 等）算不可达；`HEAD` 语义不明时用一次只读 `GET` 复核。
-  - **一次失败不拆连接**：第一次失败只撤绿并在 **1.2 秒**后复核；**连续两次**失败才交给上面的重连监督器（此后重试本身即探测，两层绝不并行）。任何一次**真实调用成功**都会清零失败计数并刷新确认，所以被防火墙挡住的探测不可能拆掉一个确实能用的连接。
-  - **节奏随活跃度**：有 MCP 活动（工具调用、模型请求组装、面板读取）时 **10 秒**一轮，2 分钟后降到 **30 秒**，5 分钟无活动即停止（定时器 unref）；活动回归自动恢复。空闲时不烧网络。
-  - **调用前预检**：距上次确认超过 **5 秒**才探测；不可达时立即以 `WORKSPACE_MCP_UNREACHABLE` 拒绝该次调用并给出原因，而不是让模型干等工具超时（默认 60 秒）。**原调用不会重放。**
-  - **不做**：不扫端口、不发凭据、不新建 MCP 会话、不替代重连。HTTP 可达**不等于** MCP 会话健康——进程活着但会话假死仍只能靠调用时的类型化错误发现。
-- **不做什么**：不自动重放失败的工具 / 资源请求、不替 UnityEditor 启动或打开服务器。断线由已验证原生生命周期信号、有类型的请求错误或上述可达性探测识别，普通工具业务错误、取消与单纯调用超时不当成断线。HTTP 会话 404 经有类型的调用错误识别为 `SESSION_EXPIRED` 后，退避建立新连接并重新 initialize；原调用仍失败，不重放。
+连接状态来自原生桥接的 `McpConnectionStatus`（经 `ctx.mcpClientHost` 挂载的实例，其状态句柄由 `onChange` 推送）。插件不再自建重试定时器，也不按版本号或内部导出名做能力探测——**桥接负责连接、退避与尝试预算**，插件只做翻译与本地判定。
 
+| 原生状态 | 面板状态 | 说明 |
+|---|---|---|
+| `connecting` | `pending`（连接中） | 首次尝试或替换代正在握手 |
+| `connected` | `connected`（已连接） | HTTP 行另有 `verified` 与 `lastVerifiedAt`；超过两个探测周期未确认时本地撤绿（**零网络**），显示「待确认」 |
+| `reconnecting` | `reconnecting`（重连中 · Ns） | 行携带桥接给的 `attempt` / `maxAttempts` / `nextRetryAt` / `reason`；客户端每秒本地刷新倒计时，不额外请求 |
+| `failed: gave-up` | `failed` + `RECONNECT_GAVE_UP` | 桥接用尽本轮的尝试预算；面板给「重试」 |
+| `failed: reconnect-disabled` | `failed` + `RECONNECT_DISABLED` | 关闭自动重连后断开 |
+| `failed: unclosed-generation` | `failed` + `CLOSE_UNCONFIRMED` | 旧代无法确认关闭，该名字不再重生（换会话或重启宿主） |
+| `waiting-authorization` | `authorization`（需要授权） | 行带 `authorization.reason`（`missing`/`expired`/`binding`/`rejected`/`scope`）与桥接诊断文本；主按钮变成「授权」 |
+| `waiting-credentials` | `failed` + `MISSING_CREDENTIALS` | 桥接的凭据模板缺少值（本插件在载入期就展开变量，通常先以声明诊断出现） |
+| `closed` | `unloaded` / `failed` | 正常结束是未加载；清理未确认则是 `CLOSE_UNCONFIRMED` |
+
+- **操作语义**：「连接」区分**授权**（策略未允许 → 钉手动模式）与**重试**（策略已允许 → 只重连一次）；「断开」粘性；「恢复自动」丢掉手动选择。0.2.3 起「重试」等价于结束当前实例并重新挂载，因为桥接的重连由实例自己持有。
+- **策略撤销即时生效**：保存配置让某个自动连接的服务器不再被允许时，其实例被结束；不会继续按桥接的退避重试。
+- **`required` 故障**：已选 `required` 服务器启动失败或断线时，模型请求持续拒绝，直到它恢复；健康同伴不受影响。
+- **静默失联与不可见失效**：桥接只能在 transport 报出关闭时知道断线（stdio 子进程退出、SSE 流断开）。HTTP 端点「还活着但会话已失效」（服务端重启后旧 `Mcp-Session-Id` 无效）不会被 transport 报成关闭：该行保持已连接，下一次调用失败一次且不重放，用户「断开」再「连接」（或改声明）即可重新 initialize。这是有意的取舍：不按错误文本猜断线。
+- **只读可达性探测**（`src/health.js`）仍然是静默失联的补充：只对 `streamable-http` 且已连接的行，`HEAD` 1.5 秒超时、不带凭据、`redirect: 'manual'`；**任何 HTTP 响应都算存活**，只有网络层错误算不可达；`HEAD` 语义不明时用一次只读 `GET` 复核。
+  - 第一次失败只撤绿并在 **1.2 秒**后复核；**连续两次**失败会**替换连接代**（dispose 后重新 mount），因为桥接无法报告一个不回应任何请求的端点。
+  - 节奏随活跃度：有 MCP 活动时 **10 秒**一轮，2 分钟后 **30 秒**，5 分钟无活动即停止（定时器 unref）。
+  - **调用前预检**：距上次确认超过 **5 秒**才探测；不可达时立即以 `WORKSPACE_MCP_UNREACHABLE` 拒绝该次调用并给出原因，而不是让模型干等工具超时。原调用不会重放。
+  - 不扫端口、不发凭据、不新建 MCP 会话。HTTP 可达**不等于**会话健康。
+- **测试连接**：每行「测试」经 `ctx.mcpClientHost.probe()` 做一次真实握手 + 工具列举（stdio / HTTP 均可），不注册工具、不占名字、不触碰现有连接；结果给服务器身份、工具数、耗时，失败给阶段与消息。成功即结算该行的可信度，失败只撤绿、不拆连接。
+- **清理结果可信**：`dispose()` 返回 `closeConfirmed` / `cleanupError`；无法确认关闭时该名字标记 `CLOSE_UNCONFIRMED`，直到重启宿主。
+
+### 浏览器授权（OAuth）
+
+声明里给 Streamable HTTP 服务器加 `oauth`（`true` 或对象）即可走 MCP OAuth：
+
+- 字段：`clientId`、`scope`、`credentialKey`、`requestTimeoutMs`、`authorizationTimeoutMs`；省略 `credentialKey` 时按服务器名与端点派生。
+- 被动连接不会打开浏览器。行显示「需要授权」与原因；「授权」（`POST /workspace-mcp/authorize`）启动 DSH 的授权流程，面板给出授权页链接；「取消授权」（`POST /workspace-mcp/cancelAuthorize`）撤回进行中的尝试（已保存的授权保留）。
+- 授权完成后凭据记录更新，桥接自行重连该服务器；工具列表随新连接重新发布。
+- `oauth` 与 `Authorization` 头（含 `bearer_token_env_var`）互斥，stdio 服务器也不能声明：分别以 `CONFLICTING_AUTH_HEADERS` / `INVALID_OAUTH` 拒绝该条目。
+
+### 工具加载方式
+
+`toolLoading`（默认 `on-demand`）决定工具是进提示词目录还是全量注册；`catalogDescriptionMaxLength`（默认 160）限制目录里每行简介长度。单条声明可覆盖这两个值。按需行的工具不占工具位：桥接注册一个 `mcp__<server>__load_tools`，模型按目录加载；被加载的工具仍受本插件的工具闸门与项目 `includeTools`/`excludeTools` 约束——加载器本身除外（它是过滤的传输手段，面板也不会把它列成「项目已禁用」）。
 ## 数据通道
 
 | 项 | 说明 |
@@ -101,6 +121,9 @@
 | 手动连接 | `POST /workspace-mcp/connect`，body `{ sessionId, serverId? }` |
 | 手动断开 | `POST /workspace-mcp/disconnect`，body `{ sessionId, serverId? }` |
 | 恢复自动 | `POST /workspace-mcp/follow`，body `{ sessionId }`——丢掉手动选择，回到按策略判定 |
+| 发起授权 | `POST /workspace-mcp/authorize`，body `{ sessionId, serverId }`——启动/恢复该服务器的浏览器授权 |
+| 取消授权 | `POST /workspace-mcp/cancelAuthorize`，body `{ sessionId, serverId }`——撤回进行中的尝试，不动已保存的授权 |
+| 测试连接 | `POST /workspace-mcp/probe`，body `{ sessionId, serverId }`——一次真实握手与工具列举 |
 | 读配置 | `GET /workspace-mcp/config` |
 | 写配置 | `POST /workspace-mcp/config`，body `{ patch: { enabledBuiltins?, presets?, ... } }` |
 | 取令牌 | `GET /workspace-mcp/handshake`（唯一不要求令牌的动作） |

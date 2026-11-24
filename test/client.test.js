@@ -1,4 +1,7 @@
 import test from 'node:test';
+
+/** The process-global fetch these tests replace; restored so one file cannot starve another. */
+const nativeFetch = globalThis.fetch;
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -229,7 +232,7 @@ test('control requests take the injected token, else the handshake, and retry on
     assert.deepEqual(await request('/config'), { ok: true });
     assert.equal(calls.at(-1).token, 'fresh', 'the replacement token is remembered');
   } finally {
-    delete globalThis.fetch;
+    globalThis.fetch = nativeFetch;
   }
 });
 
@@ -288,7 +291,7 @@ test('the request layer keeps the host error code, so not-ready is distinguishab
       return true;
     });
   } finally {
-    delete globalThis.fetch;
+    globalThis.fetch = nativeFetch;
   }
 });
 
@@ -309,7 +312,7 @@ test('a long-poll read can be aborted and downgraded by its caller', async () =>
     assert.deepEqual(await request('/wait?sessionId=s&version=0', undefined, controller.signal), { version: 7 });
     assert.equal(seen.at(-1).signal, controller.signal, 'the caller signal reaches fetch, so a held request can be released');
   } finally {
-    delete globalThis.fetch;
+    globalThis.fetch = nativeFetch;
   }
 });
 
@@ -383,7 +386,7 @@ test('the bundle page renders a one-line summary without reading the control cha
     assert.match(markup, /MCP 声明预设/);
     assert.equal(calls.length, 0, 'the Plugins page list asks for the summary view');
   } finally {
-    delete globalThis.fetch;
+    globalThis.fetch = nativeFetch;
   }
 });
 

@@ -1,5 +1,18 @@
 # 变更记录
 
+## 0.5.0：改用 `ctx.mcpClientHost`、浏览器授权、按需工具加载
+
+这一版不再自建连接层：挂载、探测、授权与断线状态全部交给原生桥接 `@deepseek-ai/dsh-mcp-client` 的 `ctx.mcpClientHost`（DSH 0.2.3 起提供，`engines.dsh: >=0.2.3-alpha.2`）。
+
+- **连接层换成 `ctx.mcpClientHost`**：每会话在其作用域边界下创建一个 `isolate` 过服务名的宿主实例，用 `validate()` 解析声明、`mount()` 挂载、`onChange` 订阅 `McpConnectionStatus`、`dispose()` 取回 `closeConfirmed` / `cleanupError`。删除了自建的 `createNativeAdapter`、按版本号与导出名的能力探测、读取 `connectionStatusOf`、日志文本匹配，以及整套自管重试定时器（`retry.js` 只剩并发名额限制）。挂载配置传 `failOnStartupError: false`，`waiting-authorization` 才不会被启动错误掩盖。
+- **断线与重试归桥接**：面板状态直接映射原生状态机（`connecting` / `connected` / `reconnecting` / `failed(gave-up|reconnect-disabled|unclosed-generation)` / `waiting-authorization` / `waiting-credentials` / `closed`），重连次数、退避与尝试预算都由桥接决定。插件只保留两件自己的事：权限被撤销时结束实例，以及**只读可达性探测**——连续两次不可达时替换连接代（dispose + 重新 mount），因为桥接无法报告一个不回应任何请求的端点。
+- **MCP OAuth 与凭据自动刷新**：声明可用 `oauth`（`true` 或 `{ clientId, scope, credentialKey, requestTimeoutMs, authorizationTimeoutMs }`），凭据存进宿主凭据服务并自动刷新。被动连接不打开浏览器：行显示「需要授权」与 `missing` / `expired` / `binding` / `rejected` / `scope` 原因，「授权」走 DSH 授权流程并给出授权页链接，「取消授权」撤回进行中的尝试。新增控制路由 `POST /workspace-mcp/authorize` 与 `/cancelAuthorize`。`oauth` 与 `Authorization` 头互斥、stdio 不能声明，分别以 `CONFLICTING_AUTH_HEADERS` / `INVALID_OAUTH` 拒绝。
+- **按需工具加载（默认开）**：`toolLoading: 'on-demand'` 让桥接把工具列进系统提示词目录、只注册一个 `mcp__<server>__load_tools`，多服务器场景不再全量占用上下文；`catalogDescriptionMaxLength`（默认 160）限制目录简介长度。单条声明可覆盖这两个值，声明字段不是任何方言的标准字段，只影响本插件。面板按需行显示「N 个工具（按需）」。
+- **按 0.2.3 契约修正的适配点**：工具准入改为 `ctx.tools.resolve()`（`step.js`）；`engines.dsh` 提到 `0.2.3-alpha.2` 并去掉 `@deepseek-ai/dsh` peer（否则会把整个元包拉进开发依赖）；devDependencies 升到 `0.2.3-alpha.2`（cordis `4.2.0-alpha.1`），测试夹具改为 `fakeHost` + 真实 `executeToolBatch` 管线。
+- **修复 `includeTools` 把按需加载器一起禁掉**：项目写了 `includeTools` 时，过滤名单里没有桥接自己注册的 `mcp__<server>__load_tools`，guard 会把它当作被禁用工具拒绝，于是该服务器的任何工具都无法加载（默认 `on-demand` 下必现）。加载器是这套过滤的传输手段而不是被过滤的工具：`tools.guard` 与闸门的 `declaredUnavailable()` 都按名单跳过它，`status` 也不再把它列进 `disabledTools`；被 `excludeTools` 排除的工具仍出现在目录里、可以加载，但调用时照旧由 guard 拒绝。回归：`test/gate.test.js`、`test/status.test.js`。
+- **明确的限制**：HTTP 服务端重启后旧会话失效、端点仍然可达时，transport 不会报关闭，本插件也不按错误文本猜断线——该行保持已连接，失败一次不重放，需「断开 → 连接」或改声明来重新 initialize。
+- **随包 skill 同步 0.5.0 行为**：`skills/dsh-mcp-glue/SKILL.md` 补上按需加载的加载／生命周期／全量开关、授权行与授权页取法，以及 `INVALID_CONFIG`、`MISSING_CREDENTIALS`、`NATIVE_UNAVAILABLE` 三类新增失败和「已连接但工具不在工具表里」的处置；验证闭环改为先 `load_tools` 再调用，声明字段表补上三个插件自有字段。
+
 ## 0.4.2：适配 DSH 0.2.3-alpha.2
 
 - **探测改走 `ctx.mcpClientHost`**：0.2.3 起 `@deepseek-ai/dsh-mcp-client` 的根入口不再导出模块级 `probeServer`，探测只能经管理方创建的主机调用。现在优先复用组合里已有的 `mcpClientHost`，没有就为本会话在插件上下文中创建一个；旧桥（0.2.0–0.2.2）的 `probeServer` 保留为兜底，不会因为升级宿主而丢掉「测试连接」。

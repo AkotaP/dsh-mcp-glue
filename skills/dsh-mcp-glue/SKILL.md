@@ -1,16 +1,19 @@
 ---
 name: dsh-mcp-glue
-description: 管理与排查 dsh-mcp-glue 插件加载的工作区级 MCP 声明（`.mcp.json`、`.vscode/mcp.json`、`.codex/config.toml` 等预设文件）：增删服务器、查看加载与连接状态、单台真实握手测试、处理 Windows 与文件沙箱下的 stdio 启动失败。适用于给当前工作区加入或移除 MCP server、配置写好但工具没出现、或需要判断声明是否被信任与自动连接时。
-whenToUse: 需要为会话工作区添加或删除 MCP server、查询 MCP 声明与连接状态、或排查 MCP 工具未出现／连接失败时。
+description: 管理与排查 dsh-mcp-glue 插件加载的工作区级 MCP 声明（`.mcp.json`、`.vscode/mcp.json`、`.codex/config.toml` 等预设文件）：增删服务器、查看加载与连接状态、单台真实握手测试、按需加载（`mcp__<server>__load_tools`）与浏览器授权（`oauth`）排障、处理 Windows 与文件沙箱下的 stdio 启动失败。适用于给当前工作区加入或移除 MCP server、配置写好但工具没出现、或需要判断声明是否被信任与自动连接时。
+whenToUse: 需要为会话工作区添加或删除 MCP server、查询 MCP 声明与连接状态、让需要浏览器授权的服务器重新可用、解决「已连接但工具不在工具列表里」，或排查 MCP 工具未出现／连接失败时。
 ---
 
-# dsh-mcp-glue（0.4.0 实测）
+# dsh-mcp-glue（0.5.0 实测）
 
-基线：DSH 0.2.2-rc.3 + Desktop profile，插件 dsh-mcp-glue 0.4.0，Windows。以下结论均为现场实测；版本变化后重新核对。
+基线：DSH 0.2.3-alpha.2 + Desktop profile，插件 dsh-mcp-glue 0.5.0，Windows。以下结论均为现场实测；版本变化后重新核对。
+
+0.5.0 起连接层改为原生桥接的 `ctx.mcpClientHost`：连接、重连与尝试预算由桥接执行，插件只做状态翻译、权限撤销与可达性探测；声明支持 `oauth` 浏览器授权，工具默认按需加载（`toolLoading: 'on-demand'`）。
 
 ## 1. 定位与前提
 
 - Loader 行 id 为 `workspace-mcp-glue`，npm 包名 `dsh-mcp-glue`；只读**当前会话工作区**的声明文件，不向父目录搜索。
+- 宿主前提：桥接须发布 `ctx.mcpClientHost`（DSH 0.2.3 起；本包 `engines.dsh: >=0.2.3-alpha.2`）。更旧的宿主上这一层整体不可用——`status.monitoring` 为 `unsupported`，连接与探测都以 `NATIVE_UNAVAILABLE` 失败；这不是声明问题，升级宿主即可。
 - 插件配置位于 profile 的 `cordis.patch.yml`：
 
 ```yaml
@@ -20,6 +23,8 @@ whenToUse: 需要为会话工作区添加或删除 MCP server、查询 MCP 声�
     trustMode: manual
     enabledBuiltins: [root, vscode]
     trustedWorkspaces: []
+    toolLoading: on-demand          # 默认值；单条声明可覆盖
+    catalogDescriptionMaxLength: 160 # 目录每行简介字符上限
 ```
 
 - 工具 shell 已提供 `DSH_SESSION_ID`、`DSH_WEB_URL`、`DSH_HOME`、`DSH_PROFILE`、`DSH_PROFILE_DIR`；控制路由需要前两个。
@@ -36,7 +41,7 @@ whenToUse: 需要为会话工作区添加或删除 MCP server、查询 MCP 声�
 | `cursor` | `.cursor/mcp.json` | `mcpServers` | JSONC |
 | `gemini` | `.gemini/settings.json` | `mcpServers` | JSONC |
 
-条目字段（标准方言）：`type`／`command`／`args`／`env`／`cwd`／`url`／`headers`／`enabled`／`disabled`／`timeout`，另支持 `envFile`、`includeTools`／`excludeTools`、`required`。字符串支持 `${env:VAR}`、`${workspaceFolder}`、`${input:id}`；插值在加载期展开，缺值即加载失败。
+条目字段（标准方言）：`type`／`command`／`args`／`env`／`cwd`／`url`／`headers`／`enabled`／`disabled`／`timeout`，另支持 `envFile`、`includeTools`／`excludeTools`、`required`。本插件自有字段（不是任何方言的标准字段）：`oauth`（见 §6.5）、`toolLoading`（`eager`／`on-demand`）、`catalogDescriptionMaxLength`（4–4096，默认 160）。字符串支持 `${env:VAR}`、`${workspaceFolder}`、`${input:id}`；插值在加载期展开，缺值即加载失败。
 
 约束：服务器名 `[A-Za-z0-9_-]{1,32}`；每工作区最多 32 台；单文件 1MB；启动超时默认 15s；不同文件同名由 `conflictPolicy` 处理（默认 `error`，冲突双方都不加载）。
 
@@ -73,18 +78,20 @@ whenToUse: 需要为会话工作区添加或删除 MCP server、查询 MCP 声�
 
 | 方法与路径 | 请求体 | 用途 |
 |---|---|---|
-| `GET status?sessionId=<id>&refresh=1` | — | 工作区、信任、选中集合、每台的 state／verified／tools／warnings、counts |
+| `GET status?sessionId=<id>&refresh=1` | — | 工作区、信任、选中集合、每台的 state／verified／loading／offeredTools／authorization／tools／warnings、counts（含 `invalid`、`authorization`） |
 | `POST declaration` `{action:"list"}` | `sessionId` | 声明文件、条目字段值与 `version` |
 | `POST probe` | `sessionId`,`serverId` | 单台真实握手与工具列表，不注册工具、不影响现有连接 |
 | `POST connect` | `sessionId`[,`serverId`] | 显式授权并连接（省略为全部） |
 | `POST disconnect` | `sessionId`[,`serverId`] | 手动断开（粘性） |
 | `POST follow` | `sessionId` | 回到策略允许的集合 |
+| `POST authorize` | `sessionId`,`serverId` | 发起/恢复该服务器的浏览器授权（OAuth），返回含 `authorization.phase` 与 `authorizationUrl` 的状态 |
+| `POST cancelAuthorize` | `sessionId`,`serverId` | 撤回进行中的授权尝试（已保存的授权保留） |
 | `GET/POST config` | 读取／`{patch}` | 插件生效配置 |
 | `POST declaration` `{action:"write"}` | `sessionId`,`preset`,`name`,`fields:[{name,value}]` | 新建条目 |
 | `POST declaration` `{action:"save"}` | `sessionId`,`serverId`,`changes`,`version` | 改字段（保留注释） |
 | `POST declaration` `{action:"remove"}` | `sessionId`,`serverId`,`version` | 删除条目 |
 
-随本 skill 提供零依赖 CLI（`scripts/mcpctl.mjs`，读 `DSH_WEB_URL` 与 `DSH_SESSION_ID`）：`node <skill 目录>/scripts/mcpctl.mjs status`，另有 `list`／`probe <serverId>`／`connect [serverId]`／`disconnect [serverId]`／`follow`／`config`／`write <preset> <name> <json>`／`remove <serverId>`。安装后的 skill 目录通常为 `$DSH_HOME/skills/dsh-mcp-glue`。
+随本 skill 提供零依赖 CLI（`scripts/mcpctl.mjs`，读 `DSH_WEB_URL` 与 `DSH_SESSION_ID`）：`node <skill 目录>/scripts/mcpctl.mjs status`，另有 `list`／`probe <serverId>`／`connect [serverId]`／`disconnect [serverId]`／`authorize <serverId>`／`cancelAuthorize <serverId>`／`follow`／`config`／`write <preset> <name> <json>`／`remove <serverId>`。安装后的 skill 目录通常为 `$DSH_HOME/skills/dsh-mcp-glue`。
 
 **写入与沙箱**：声明写入走会话自己的沙箱策略。
 
@@ -104,6 +111,18 @@ token 是进程级凭据：只在本机回环使用，不落盘、不回显到�
 
   > 该 MCP 服务器已在声明中，但当前工作区未被信任，因此没有加载。授权入口：MCP 面板的「连接」（仅本会话）、行内的「加入 allowMcp」（持久生效）、「始终信任此工作区」（整个目录）。该步骤只能由用户完成。
 
+## 6.5 连接状态、按需加载与浏览器授权（0.5.0）
+
+- **状态来自桥接**：`pending`（connecting）、`connected`、`reconnecting`（`error: CONNECTION_LOST`，带 `attempt`／`maxAttempts`／`nextRetryAt`／`reason`）、`failed`（`RECONNECT_GAVE_UP`／`RECONNECT_DISABLED`／`CLOSE_UNCONFIRMED`／`MISSING_CREDENTIALS`／`INVALID_CONFIG`／`NATIVE_UNAVAILABLE`）、`authorization`（等待浏览器授权，带 `authorization.reason` 与 `error: AUTHORIZATION_REQUIRED`）、`unloaded`；另有信任层的 `unauthorized`（见 §6）与加载层的 `invalid`。桥接不再有「无限 60 秒重试」这种自建策略。
+- **HTTP 静默失联**：插件仍做只读 `HEAD` 可达性探测；连续两次不可达会替换连接代。服务端**重启导致会话失效但端点仍可达**时，transport 不会报关闭，该行保持已连接，下一次调用失败一次且不重放——用 `disconnect` + `connect` 或改声明让它重新 initialize。不要指望它自动识别。
+- **按需加载（默认）**：插件把 `toolLoading: 'on-demand'` 传给桥接（插件配置给默认值，单条声明可覆盖）。此时工具表里只有 `mcp__<server>__load_tools`，各工具以「On-demand tools from MCP server <name>」目录写进系统提示词；`status` 行带 `loading` 与 `offeredTools`（目录条数，此时 `tools` 通常只有 loader 一个）。
+  - **加载**：调用 `mcp__<server>__load_tools`，`tools` 传目录里列出的原始工具名（不带 `mcp__<server>__` 前缀），可一次给多个。名字必须与目录逐字一致；只要有一个不存在就整批报错、不部分生效。
+  - **生命周期**：加载按会话（agent）计，加载过的工具在本会话后续轮次仍可用；该服务器换代（重连、声明改动）后，仍被提供的工具自动重新注册，不再提供的被丢弃；会话结束即释放。没有卸载工具。
+  - **与项目过滤的关系**：`mcp__<server>__load_tools` 不参与 `includeTools`／`excludeTools`——它是这套过滤的传输手段，禁掉它等于禁掉整台服务器，`status` 也不会把它列进 `disabledTools`。被项目排除的工具仍会出现在目录里、也能加载，但调用时由 guard 以 `Tool disabled by workspace MCP declaration` 拒绝（面板同样标「项目已禁用」）。
+  - **全量**：需要模型一开始就看到全部工具时，给该服务器写 `toolLoading: 'eager'`（或把插件配置默认值改成 `eager`）。`catalogDescriptionMaxLength` 只影响目录里每行简介的长度。
+- **OAuth**：声明 `oauth: true` 或 `oauth: { clientId, scope, credentialKey, requestTimeoutMs, authorizationTimeoutMs }`。被动连接不弹浏览器：行是 `authorization` 且带原因（`missing`／`expired`／`binding`／`rejected`／`scope`），用面板「授权」或 `mcpctl.mjs authorize <serverId>` 取 `authorizationUrl` 交给用户；授权完成后凭据更新会自动重连。`oauth` 与 `Authorization` 头互斥，stdio 不能声明。
+- **声明被桥接拒绝**：行状态为 `failed` 且 `error: INVALID_CONFIG`，`detail` 是桥接自己的字段级消息（例如 `mcp.same: url must be a string`）；改声明即可，不重连。
+
 ## 7. Windows
 
 - 裸 `npx`／`npm` 无法直接 spawn：Node 对 `.cmd` 返回 `EINVAL`。可用写法如下：
@@ -121,6 +140,8 @@ token 是进程级凭据：只在本机回环使用，不落盘、不回显到�
 
 排障顺序：先看该行的 `state`，再看 `error`／`errorDetail`，最后看 `warnings`。`state` 决定问题在「加载前」还是「加载后」，两者对应的处理方式不同。
 
+「工具没出现」按三层往下走，不要跳过前面的层去改连接：**声明是否被读到**（`counts.declarations`／`counts.invalid`）→ **是否被授权加载**（`unauthorized`）→ **是否已连接但被按需隐藏**（`connected` + `loading: on-demand`）。第三层最常被误判成故障，实际只需要 `load_tools`。
+
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 工具始终不出现 | 声明未加载：预设未在 `enabledBuiltins`、文件名或服务器表路径不符、`mcpServers` 与 `servers` 同时存在、同名冲突 | 由 `list` 检查 `targets` 是否包含该条目，以及 `status.counts.declarations` 是否为 0 |
@@ -129,6 +150,12 @@ token 是进程级凭据：只在本机回环使用，不落盘、不回显到�
 | `state: failed` | 启动失败：命令不存在、参数错、`EINVAL`、`EPERM` | 检查 `probe` 的 `stage`／`message`；Windows shim 见 §7 |
 | 启动失败 `spawn EINVAL` | Windows 直接 spawn `.cmd` | 改用 `node` 入口或 `cmd /d /s /c` |
 | 启动失败 `EPERM` | 沙箱阻止子进程写工作区外路径（缓存、profile 目录） | 改到工作区内路径，或申请更宽权限 |
+| 已连接，但工具不在工具表里 | 默认 `on-demand`：只注册 `mcp__<server>__load_tools`，其余工具在系统提示词目录里 | 按目录调 `mcp__<server>__load_tools` 加载目标工具；要全量注册就把声明设成 `toolLoading: 'eager'` |
+| 加载工具报「未知工具名」 | `tools` 里的名字与目录不一致，或带了 `mcp__<server>__` 前缀 | 照目录里的原始名重写；一批只要有一个错就整批不生效 |
+| `state: authorization` | 服务器要求浏览器授权，宿主没有可用授权 | 用户点面板「授权」打开授权页，或 `mcpctl authorize <serverId>` 取链接；`authorization.reason` 指出缺什么（`missing`／`expired`／`binding`／`rejected`／`scope`） |
+| `state: failed` + `MISSING_CREDENTIALS` | `headers` 引用的凭据变量还没有值（桥接的 `waiting-credentials`） | 补环境变量或 `envFile`，再重连 |
+| `state: failed` + `INVALID_CONFIG` | 桥接用自己的 schema 拒绝了该条目，与 `INVALID_DECLARATION`（文件解析失败）不是一回事 | 按该行 `detail` 改字段，改完重连；连接重试没用 |
+| `state: failed` + `NATIVE_UNAVAILABLE`，或 `monitoring: unsupported` | 宿主不提供 `ctx.mcpClientHost` | 升级 DSH 到 0.2.3 及以上 |
 | 连接正常，但每次调用都要批准 | 工作区未受信任且 `allowTools` 未含该工具 | 调用时由用户选择「总是允许」，或写入 `workspaceAllowances` |
 | `state: unauthorized` | 声明有效，但 `trustMode`／`trustedWorkspaces`／`allowMcp` 都没有授权它加载 | **交由用户授权**：面板「连接」（仅本会话）／行内「加入 allowMcp」（持久）／「始终信任此工作区」（整目录）。沙箱提权不改变信任判定，不能替代授权 |
 | 新声明没自动连接 | `trustMode: manual` 且工作区未受信任 | 同前；`connect` 等价于面板「连接」 |
@@ -145,4 +172,4 @@ token 是进程级凭据：只在本机回环使用，不落盘、不回显到�
 2. 由 `mcpctl status` 检查 `counts.invalid`／`counts.warnings` 与每行 `error`／`errorDetail`／`warnings`；
 3. 由 `mcpctl probe <serverId>` 执行一次真实握手（`ok: true` 且 `toolNames` 非空）；
 4. 由 `mcpctl status` 确认 `state: connected`、`verified: true`、`problems: 0`；
-5. 新工具在**下一轮**对话进入模型工具表，名称形如 `mcp__<server>__<tool>`。
+5. 新服务器在**下一轮**对话生效：默认 `on-demand` 下只多一个 `mcp__<server>__load_tools`，其余工具名在该服务器目录里列出；先调用它加载，之后即可直接调用 `mcp__<server>__<tool>`，加载结果在本会话后续轮次保留。声明写 `toolLoading: 'eager'` 时则下一轮就全量注册。
