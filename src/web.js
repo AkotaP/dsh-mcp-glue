@@ -200,6 +200,8 @@ export function installWebControl(ctx, control) {
       ? html.replace('</head>', `<script>window.${TOKEN_GLOBAL}=${JSON.stringify(token)}</script></head>`)
       : `<script>window.${TOKEN_GLOBAL}=${JSON.stringify(token)}</script>${html}`;
   disposers.push(webServer.tapIndex(tap));
-  disposers.push(webServer.register({ kind: 'prefix', path: ROUTE, handler: createWebHandler(control, token, ctx.logger) }));
+  // 本机脚本（skills 下的 mcpctl.mjs）没有 Cookie，DSH 0.2.3 起命名路由默认 auth:'required'；
+  // 该 handler 自带 loopback + 同源 + 每进程 token 三层校验，显式匿名不降低安全性。
+  disposers.push(webServer.register({ kind: 'prefix', path: ROUTE, auth: 'anonymous', handler: createWebHandler(control, token, ctx.logger) }));
   return () => { for (const dispose of disposers) { try { dispose(); } catch { /* already gone */ } } };
 }

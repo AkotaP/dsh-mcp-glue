@@ -1,5 +1,10 @@
 # 变更记录
 
+## 0.4.2：适配 DSH 0.2.3-alpha.2
+
+- **探测改走 `ctx.mcpClientHost`**：0.2.3 起 `@deepseek-ai/dsh-mcp-client` 的根入口不再导出模块级 `probeServer`，探测只能经管理方创建的主机调用。现在优先复用组合里已有的 `mcpClientHost`，没有就为本会话在插件上下文中创建一个；旧桥（0.2.0–0.2.2）的 `probeServer` 保留为兜底，不会因为升级宿主而丢掉「测试连接」。
+- **控制路由声明匿名准入**：0.2.3 起 `webServer.register` 的命名路由默认 `auth: 'required'`，没有 Cookie 的本机进程调用会被 503/401 挡住，`skills/dsh-mcp-glue/scripts/mcpctl.mjs` 的 status/list/probe/connect 全部失效。该 handler 自带 loopback、同源与每进程 token 三层校验，显式声明 `auth: 'anonymous'` 不降低安全性。
+
 ## 0.4.1：会话失效识别补全
 
 - **HTTP 400 也算会话失效**：原先只有 `404` 会被判成 `SESSION_EXPIRED`。服务端用 `400` 回 `-32600 Session not found` 时分类落空（返回 `undefined`），插件不发射失败事件——面板继续显示已连接，也不会自动重连。现在 `400` 必须由响应体明确提到会话失效才判，普通请求错误（如 `Invalid params`）不会触发重连。

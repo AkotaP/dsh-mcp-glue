@@ -76,10 +76,14 @@ test('the control facade forwards a one-shot probe and refuses an undeclared ser
     { source: { preset: 'fixture', file: '.mcp.json', server: 'demo' },
       spec: { required: false, config: { serverName: 'demo', transport: 'streamable-http', url: 'http://fixture.invalid/mcp' } } },
   ] };
+  // 0.2.3 的桥只经 `McpClientHost` 暴露一次性探测，不再导出模块级 `probeServer`。
   state.nativePlugin = { ...state.nativePlugin,
-    async probeServer(ownerCtx, config, options) {
-      calls.push({ ownerCtx, config, options });
-      return { ok: true, toolNames: ['identity'], truncated: false, durationMs: 5, closeConfirmed: true };
+    McpClientHost: class {
+      constructor(ownerCtx) { this.ownerCtx = ownerCtx; }
+      async probe(config, options) {
+        calls.push({ ownerCtx: this.ownerCtx, config, options });
+        return { ok: true, toolNames: ['identity'], truncated: false, durationMs: 5, closeConfirmed: true };
+      }
     } };
   const control = createControl(ctx, candidate => (candidate === value ? state : undefined));
   const result = await control.probe('wait-agent', 'demo');
@@ -87,6 +91,7 @@ test('the control facade forwards a one-shot probe and refuses an undeclared ser
   assert.equal(calls.length, 1);
   assert.equal(calls[0].config.serverName, 'demo');
   assert.equal(calls[0].options.timeoutMs, 10000);
+  assert.equal(calls[0].ownerCtx, state.scopeOwner, 'the host is created below the session owner context');
   await assert.rejects(control.probe('wait-agent', 'missing'), failure => failure.code === 'UNKNOWN_SERVER');
   await assert.rejects(control.probe('wait-agent', undefined), /server id/);
 });

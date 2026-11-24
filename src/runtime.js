@@ -123,6 +123,8 @@ export class WorkspaceMcpSession {
     this.logger = logger ?? agent.ctx.logger;
     // A context that injects `tools`/`systemPrompt`, used for the guard and base assemblies.
     this.scopeOwner = scopeOwner ?? agent.ctx;
+    /** Cached `ctx.mcpClientHost`; see {@link WorkspaceMcpSession#probeHost}. */
+    this.probeHostRef = undefined;
     /** Services the Agent's own context may not reach (see the entry file's inject note). */
     this.optionalServices = optionalServices ?? {};
     this.abort = new AbortController(); this.queue = Promise.resolve(); this.closed = false;
@@ -1097,10 +1099,10 @@ export class WorkspaceMcpSession {
   async probe(serverId) {
     const entry = (this.plan?.servers ?? []).find(item => item.spec.config.serverName === serverId);
     if (entry === undefined) throw Object.assign(new Error('workspace-mcp: no such declared server'), { code: 'UNKNOWN_SERVER' });
-    const probe = this.nativePlugin?.probeServer;
-    if (typeof probe !== 'function') throw Object.assign(new Error('workspace-mcp: the loaded MCP bridge cannot probe servers'), { code: 'PROBE_UNSUPPORTED' });
+    const host = this.probeHost();
+    if (host === undefined) throw Object.assign(new Error('workspace-mcp: the loaded MCP bridge cannot probe servers'), { code: 'PROBE_UNSUPPORTED' });
     this.noteActivity();
-    const outcome = await probe.call(this.nativePlugin, this.scopeOwner, entry.spec.config, { timeoutMs: this.config.probeTimeoutMs ?? 10000 });
+    const outcome = await host.probe(entry.spec.config, { timeoutMs: this.config.probeTimeoutMs ?? 10000 });
     // The probe is the only MCP-level evidence available on demand, so let it settle this
     // row's confidence. A success confirms the session; a failure only withholds the green
     // claim, because a short budget or a busy server is not proof that the live mount died.
@@ -1118,6 +1120,31 @@ export class WorkspaceMcpSession {
     }
     return outcome;
   }
+  /**
+   * Resolve the bridge's management host, `ctx.mcpClientHost`.
+   *
+   * The bridge no longer exports a module-level `probeServer`; probing is available through the host a
+   * managing plugin owns. Reuse a host the composition already provides, otherwise create one below this
+   * session's owner context so probes end with the plugin.
+   * @returns the host, or undefined when the loaded bridge predates `McpClientHost`.
+   */
+  probeHost() {
+    if (this.probeHostRef !== undefined) return this.probeHostRef;
+    let provided;
+    try { provided = this.scopeOwner?.get?.('mcpClientHost'); } catch { provided = undefined; }
+    if (provided !== undefined) return (this.probeHostRef = provided);
+    const HostClass = this.nativePlugin?.McpClientHost;
+    if (typeof HostClass === 'function') return (this.probeHostRef = new HostClass(this.scopeOwner));
+    // Bridges before 0.2.3 expose the one-shot probe as a module function instead.
+    const legacy = this.nativePlugin?.probeServer;
+    if (typeof legacy === 'function') {
+      return (this.probeHostRef = {
+        probe: (config, options) => legacy.call(this.nativePlugin, this.scopeOwner, config, options),
+      });
+    }
+    return undefined;
+  }
+
   /** Model-facing tool names this server currently publishes in the Agent scope. */
   toolNamesFor(serverName) {
     const prefix = `mcp__${serverName}__`;
