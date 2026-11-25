@@ -197,7 +197,7 @@ export function normalizeServer(rawName, raw, preset, context, fileEnv = {}) {
       if (Object.keys(config.headers).some(k => k.toLowerCase() === 'authorization')) fail('CONFLICTING_AUTH_HEADERS', 'headers 里已经有 Authorization，不能再声明 bearer_token_env_var');
       config.headers.Authorization = `Bearer ${context.env[key]}`;
     }
-    const invalidHeader = Object.entries(config.headers).find(([k, v]) => !/^[!#$%&'*+.^`|~0-9A-Za-z-]+$/.test(k) || /[\r\n\0]/.test(v));
+    const invalidHeader = Object.entries(config.headers).find(([k, v]) => !/^[!#$%&'*+.^`|~0-9A-Za-z_-]+$/.test(k) || /[\r\n\0]/.test(v));
     if (invalidHeader !== undefined) fail('INVALID_HEADERS', `头 ${invalidHeader[0]} 的名称或值不合法`);
     const oauth = oauthOf(raw.oauth, serverName, config.url, config.headers);
     if (oauth !== undefined) config.oauth = oauth;
